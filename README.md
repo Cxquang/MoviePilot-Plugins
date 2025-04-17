@@ -1,5 +1,5 @@
 # MoviePilot-Plugins
-MoviePilot官方插件市场：https://github.com/jxxghp/MoviePilot-Plugins
+MoviePilot第三方插件市场：https://github.com/Cxquang/MoviePilot-Plugins
 
 ## 第三方插件库开发说明
 > 请不要开发用于破解MoviePilot用户认证、色情、赌博等违法违规内容的插件，共同维护健康的开发环境！
