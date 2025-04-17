@@ -1,53 +1,47 @@
-import re
-import time
-import hmac
-import hashlib
-import base64
-import urllib.parse
+from typing import Any, List, Dict, Tuple
 
-from app.plugins import _PluginBase
 from app.core.event import eventmanager, Event
+from app.log import logger
+from app.plugins import _PluginBase
 from app.schemas.types import EventType, NotificationType
 from app.utils.http import RequestUtils
-from typing import Any, List, Dict, Tuple
-from app.log import logger
 
 
-class DingdingMsg(_PluginBase):
+class ExportMsg(_PluginBase):
     # 插件名称
-    plugin_name = "钉钉机器人"
+    plugin_name = "消息通知暴露"
     # 插件描述
-    plugin_desc = "支持使用钉钉机器人发送消息通知。"
+    plugin_desc = "消息通知暴露给需要使用的服务，可以接收消息进一步处理"
     # 插件图标
-    plugin_icon = "Dingding_A.png"
+    plugin_icon = "Plugins_A.png"
     # 插件版本
-    plugin_version = "1.12"
+    plugin_version = "1.0"
     # 插件作者
-    plugin_author = "nnlegenda"
+    plugin_author = "Cxquang"
     # 作者主页
-    author_url = "https://github.com/nnlegenda"
+    author_url = "https://github.com/Cxquang"
     # 插件配置项ID前缀
-    plugin_config_prefix = "dingdingmsg_"
+    plugin_config_prefix = "exportmsg_"
     # 加载顺序
-    plugin_order = 25
+    plugin_order = 29
     # 可使用的用户级别
     auth_level = 1
 
     # 私有属性
     _enabled = False
     _token = None
-    _secret = None
     _msgtypes = []
+    _topic = None  # 新增topic字段
 
     def init_plugin(self, config: dict = None):
         if config:
             self._enabled = config.get("enabled")
-            self._token = config.get("token")
-            self._secret = config.get("secret")
+            self._url = config.get("url")
             self._msgtypes = config.get("msgtypes") or []
+            self._topic = config.get("topic")  # 新增topic字段
 
     def get_state(self) -> bool:
-        return self._enabled and (True if self._token else False) and (True if self._secret else False)
+        return self._enabled and (True if self._token else False)
 
     @staticmethod
     def get_command() -> List[Dict[str, Any]]:
@@ -104,30 +98,9 @@ class DingdingMsg(_PluginBase):
                                     {
                                         'component': 'VTextField',
                                         'props': {
-                                            'model': 'token',
-                                            'label': '钉钉机器人token',
-                                            'placeholder': 'xxxxxx',
-                                        }
-                                    }
-                                ]
-                            }
-                        ]
-                    },
-                    {
-                        'component': 'VRow',
-                        'content': [
-                            {
-                                'component': 'VCol',
-                                'props': {
-                                    'cols': 12
-                                },
-                                'content': [
-                                    {
-                                        'component': 'VTextField',
-                                        'props': {
-                                            'model': 'secret',
-                                            'label': '加签',
-                                            'placeholder': 'SECxxx',
+                                            'model': 'url',
+                                            'label': '需要接收通知的地址',
+                                            'placeholder': 'http://xxx.com/api/private/v1/recept',
                                         }
                                     }
                                 ]
@@ -157,11 +130,33 @@ class DingdingMsg(_PluginBase):
                             }
                         ]
                     },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12,
+                                },
+                                'content': [
+                                    {
+                                        'component': 'VAlert',
+                                        'props': {
+                                            'type': 'info',
+                                            'variant': 'tonal',
+                                            'text': ''
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
+                    }
                 ]
             }
         ], {
             "enabled": False,
             'token': '',
+            'topic': '',
             'msgtypes': []
         }
 
@@ -190,8 +185,6 @@ class DingdingMsg(_PluginBase):
         title = msg_body.get("title")
         # 文本
         text = msg_body.get("text")
-        # 封面
-        cover = msg_body.get("image")
 
         if not title and not text:
             logger.warn("标题和内容不能同时为空")
@@ -202,68 +195,37 @@ class DingdingMsg(_PluginBase):
             logger.info(f"消息类型 {msg_type.value} 未开启消息发送")
             return
 
-        sc_url = self.url_sign(self._token, self._secret)
-
         try:
-
-            if text:
-                # 对text进行Markdown特殊字符转义
-                text = re.sub(r"([_`])", r"\\\1", text)
-            else:
-                text = ""
-
-            if cover:
-                data = {
-                    "msgtype": "markdown",
-                    "markdown": {
-                        "title": title,
-                        "text": "### %s\n\n"
-                                "![Cover](%s)\n\n"
-                                "> %s\n\n > MoviePilot %s\n" % (title, cover, text, msg_type.value)
-                    }
-                }
-            else:
-                data = {
-                    "msgtype": "markdown",
-                    "markdown": {
-                        "title": title,
-                        "text": "### %s\n\n"
-                                "> %s\n\n > MoviePilot %s\n" % (title, text, msg_type.value)
-                    }
-                }
-            res = RequestUtils(content_type="application/json").post_res(sc_url, json=data)
+            event_info = {
+                "url": self._url,
+                "title": title,
+                "content": text,
+                "template": "txt",
+                "channel": "wechat",
+            }
+            # 如果配置了topic，添加到请求参数
+            if self._topic:
+                event_info["topic"] = self._topic
+            # 构建url
+            sc_url = self._url
+            res = RequestUtils(content_type="application/json").post_res(sc_url, json=event_info)
             if res and res.status_code == 200:
                 ret_json = res.json()
-                errno = ret_json.get('errcode')
-                error = ret_json.get('errmsg')
-                if errno == 0:
-                    logger.info("钉钉机器人消息发送成功")
+                code = ret_json.get('code')
+                msg = ret_json.get('msg')
+                if code == 200:
+                    logger.info("export消息发送成功")
                 else:
-                    logger.warn(f"钉钉机器人消息发送失败，错误码：{errno}，错误原因：{error}")
+                    logger.warn(f"export消息发送，接口返回失败，错误码：{code}，错误原因：{msg}")
             elif res is not None:
-                logger.warn(f"钉钉机器人消息发送失败，错误码：{res.status_code}，错误原因：{res.reason}")
+                logger.warn(f"export消息发送失败，错误码：{res.status_code}，错误原因：{res.reason}")
             else:
-                logger.warn("钉钉机器人消息发送失败，未获取到返回信息")
+                logger.warn("export消息发送失败，未获取到返回信息")
         except Exception as msg_e:
-            logger.error(f"钉钉机器人消息发送失败，{str(msg_e)}")
+            logger.error(f"export消息发送异常，{str(msg_e)}")
 
     def stop_service(self):
         """
         退出插件
         """
         pass
-
-    def url_sign(self, access_token: str, secret: str) -> str:
-        """
-        加签
-        """
-        # 生成时间戳和签名
-        timestamp = str(round(time.time() * 1000))
-        secret_enc = secret.encode('utf-8')
-        string_to_sign = '{}\n{}'.format(timestamp, secret)
-        string_to_sign_enc = string_to_sign.encode('utf-8')
-        hmac_code = hmac.new(secret_enc, string_to_sign_enc, digestmod=hashlib.sha256).digest()
-        sign = urllib.parse.quote_plus(base64.b64encode(hmac_code))
-        # 组合请求的完整 URL
-        full_url = f'https://oapi.dingtalk.com/robot/send?access_token={access_token}&timestamp={timestamp}&sign={sign}'
-        return full_url
