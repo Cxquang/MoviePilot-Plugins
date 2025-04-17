@@ -29,7 +29,7 @@ class ExportMsg(_PluginBase):
 
     # 私有属性
     _enabled = False
-    _token = None
+    _url = None
     _msgtypes = []
     _topic = None  # 新增topic字段
 
@@ -41,7 +41,7 @@ class ExportMsg(_PluginBase):
             self._topic = config.get("topic")  # 新增topic字段
 
     def get_state(self) -> bool:
-        return self._enabled and (True if self._token else False)
+        return self._enabled and (True if self._url else False)
 
     @staticmethod
     def get_command() -> List[Dict[str, Any]]:
@@ -154,8 +154,8 @@ class ExportMsg(_PluginBase):
                 ]
             }
         ], {
-            "enabled": False,
-            'token': '',
+            "enabled": True,
+            'url': '',
             'topic': '',
             'msgtypes': []
         }
@@ -186,6 +186,7 @@ class ExportMsg(_PluginBase):
         # 文本
         text = msg_body.get("text")
 
+        logger.info(f"这里触发了exportMsg")
         if not title and not text:
             logger.warn("标题和内容不能同时为空")
             return
@@ -195,7 +196,7 @@ class ExportMsg(_PluginBase):
             logger.info(f"消息类型 {msg_type.value} 未开启消息发送")
             return
 
-        try:
+        # try:
             event_info = {
                 "url": self._url,
                 "title": title,
@@ -209,20 +210,21 @@ class ExportMsg(_PluginBase):
             # 构建url
             sc_url = self._url
             res = RequestUtils(content_type="application/json").post_res(sc_url, json=event_info)
-            if res and res.status_code == 200:
-                ret_json = res.json()
-                code = ret_json.get('code')
-                msg = ret_json.get('msg')
-                if code == 200:
-                    logger.info("export消息发送成功")
-                else:
-                    logger.warn(f"export消息发送，接口返回失败，错误码：{code}，错误原因：{msg}")
-            elif res is not None:
-                logger.warn(f"export消息发送失败，错误码：{res.status_code}，错误原因：{res.reason}")
-            else:
-                logger.warn("export消息发送失败，未获取到返回信息")
-        except Exception as msg_e:
-            logger.error(f"export消息发送异常，{str(msg_e)}")
+        #     if res:
+        #         ret_json = res.json()
+        #         logger.info(ret_json)
+        #         code = ret_json.get('meta').get('status')
+        #         msg = ret_json.get('meta').get('msg')
+        #         if code == 200:
+        #             logger.info("export消息发送成功")
+        #         else:
+        #             logger.warn(f"export消息发送，接口返回失败，错误码：{code}，错误原因：{msg}")
+        #     elif res is not None:
+        #         logger.warn(f"export消息发送失败，错误码：{res.status_code}，错误原因：{res.reason}")
+        #     else:
+        #         logger.warn("export消息发送失败，未获取到返回信息")
+        # except Exception as msg_e:
+        #     logger.error(f"export消息发送异常，{str(msg_e)}")
 
     def stop_service(self):
         """
