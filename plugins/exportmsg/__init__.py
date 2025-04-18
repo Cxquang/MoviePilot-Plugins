@@ -15,7 +15,7 @@ class ExportMsg(_PluginBase):
     # 插件图标
     plugin_icon = "Plugins_A.png"
     # 插件版本
-    plugin_version = "1.01"
+    plugin_version = "1.02"
     # 插件作者
     plugin_author = "Cxquang"
     # 作者主页
@@ -196,7 +196,7 @@ class ExportMsg(_PluginBase):
             logger.info(f"消息类型 {msg_type.value} 未开启消息发送")
             return
 
-        # try:
+        try:
             event_info = {
                 "url": self._url,
                 "title": title,
@@ -209,22 +209,23 @@ class ExportMsg(_PluginBase):
                 event_info["topic"] = self._topic
             # 构建url
             sc_url = self._url
+            logger.info(sc_url)
             res = RequestUtils(content_type="application/json").post_res(sc_url, json=event_info)
-        #     if res:
-        #         ret_json = res.json()
-        #         logger.info(ret_json)
-        #         code = ret_json.get('meta').get('status')
-        #         msg = ret_json.get('meta').get('msg')
-        #         if code == 200:
-        #             logger.info("export消息发送成功")
-        #         else:
-        #             logger.warn(f"export消息发送，接口返回失败，错误码：{code}，错误原因：{msg}")
-        #     elif res is not None:
-        #         logger.warn(f"export消息发送失败，错误码：{res.status_code}，错误原因：{res.reason}")
-        #     else:
-        #         logger.warn("export消息发送失败，未获取到返回信息")
-        # except Exception as msg_e:
-        #     logger.error(f"export消息发送异常，{str(msg_e)}")
+            if res:
+                ret_json = res.json()
+                logger.info(ret_json)
+                code = ret_json.get('meta').get('status')
+                msg = ret_json.get('meta').get('msg')
+                if code == 200:
+                    logger.info("export消息发送成功")
+                else:
+                    logger.warn(f"export消息发送，接口返回失败，错误码：{code}，错误原因：{msg}")
+            elif res is not None:
+                logger.warn(f"export消息发送失败，错误码：{res.status_code}，错误原因：{res.reason}")
+            else:
+                logger.warn("export消息发送失败，未获取到返回信息")
+        except Exception as msg_e:
+            logger.error(f"export消息发送异常，{str(msg_e)}")
 
     def stop_service(self):
         """
