@@ -1,4 +1,7 @@
+import json
 from typing import Any, List, Dict, Tuple
+
+import requests.exceptions
 
 from app.core.event import eventmanager, Event
 from app.log import logger
@@ -15,7 +18,7 @@ class ExportMsg(_PluginBase):
     # 插件图标
     plugin_icon = "Plugins_A.png"
     # 插件版本
-    plugin_version = "1.02"
+    plugin_version = "1.03"
     # 插件作者
     plugin_author = "Cxquang"
     # 作者主页
@@ -211,21 +214,40 @@ class ExportMsg(_PluginBase):
             sc_url = self._url
             logger.info(sc_url)
             res = RequestUtils(content_type="application/json").post_res(sc_url, json=event_info)
-            if res:
+
+            # 检查响应是否存在
+            if res is None:
+                logger.error("请求失败：未收到响应")
+                return
+            # 记录详细日志
+            logger.debug(f"响应状态码: {res.status_code}")
+            logger.debug(f"响应头: {res.headers}")
+            logger.debug(f"响应内容: {res.text}")
+
+            # 检查HTTP状态码
+            if res.status_code != 200:
+                logger.error(f"请求失败，状态码：{res.status_code}")
+                return
+
+            # 检查响应体是否为空
+            if not res.text.strip():
+                logger.error("响应内容为空")
+                return
+
+            # 安全解析JSON
+            try:
                 ret_json = res.json()
-                logger.info(ret_json)
-                code = ret_json.get('meta').get('status')
-                msg = ret_json.get('meta').get('msg')
-                if code == 200:
-                    logger.info("export消息发送成功")
-                else:
-                    logger.warn(f"export消息发送，接口返回失败，错误码：{code}，错误原因：{msg}")
-            elif res is not None:
-                logger.warn(f"export消息发送失败，错误码：{res.status_code}，错误原因：{res.reason}")
+            except json.JSONDecodeError as e:
+                logger.error(f"JSON解析失败：{e}，响应内容：{res.text[:200]}...")
+                return
+            code = ret_json.get('meta').get('status')
+            msg = ret_json.get('meta').get('msg')
+            if code == 200:
+                logger.info("export消息发送成功")
             else:
-                logger.warn("export消息发送失败，未获取到返回信息")
-        except Exception as msg_e:
-            logger.error(f"export消息发送异常，{str(msg_e)}")
+                logger.warn(f"export消息发送，接口返回失败，错误码：{code}，错误原因：{msg}")
+        except requests.exceptions.RequestException as msg_e:
+            logger.error(f"未知错误，{str(msg_e)}", exc_info=True)
 
     def stop_service(self):
         """
