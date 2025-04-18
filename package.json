@@ -3,7 +3,7 @@
         "name": "消息通知暴露",
         "description": "消息通知暴露给需要使用的服务，可以接收消息进一步处理",
         "labels": "消息通知",
-        "version": "1.03",
+        "version": "1.04",
         "icon": "Plugins_A.png",
         "author": "Cxquang",
         "level": 1,

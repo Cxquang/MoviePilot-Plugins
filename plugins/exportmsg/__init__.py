@@ -18,7 +18,7 @@ class ExportMsg(_PluginBase):
     # 插件图标
     plugin_icon = "Plugins_A.png"
     # 插件版本
-    plugin_version = "1.03"
+    plugin_version = "1.04"
     # 插件作者
     plugin_author = "Cxquang"
     # 作者主页
@@ -213,6 +213,9 @@ class ExportMsg(_PluginBase):
             # 构建url
             sc_url = self._url
             logger.info(sc_url)
+
+            # 新增调试日志
+            logger.debug(f"准备发送事件到 {self._url}，数据：{event_info}")
             res = RequestUtils(content_type="application/json").post_res(sc_url, json=event_info)
 
             # 检查响应是否存在
