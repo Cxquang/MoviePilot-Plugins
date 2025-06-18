@@ -80,7 +80,7 @@ class DynamicWeChatIpv6(_PluginBase):
     # _ip_pattern = r'\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b'
     _ip_pattern = r'\b(?:[a-fA-F0-9]{1,4}:){7}[a-fA-F0-9]{1,4}\b|::1\b'
     # 获取ip地址的网址列表
-    _ip_urls = ["https://www.oneblood.top:8068/api/private/v1/get/ipv6"]
+    _ip_urls = ["http://192.168.123.109:8067/api/private/v1/get/ipv6"]
     # 当前ip地址
     _current_ip_address = '0.0.0.0'
     # 企业微信登录
