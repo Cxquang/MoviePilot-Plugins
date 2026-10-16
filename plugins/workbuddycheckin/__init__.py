@@ -15,13 +15,20 @@ from app.log import logger
 from app.core.event import eventmanager, EventType
 
 
+class TokenInvalidError(Exception):
+    """refreshToken 已失效（被服务端拒绝），需要用户重新提取并填写"""
+    def __init__(self, detail: str = ""):
+        self.detail = detail
+        super().__init__(detail or "refreshToken 已失效")
+
+
 class WorkBuddyCheckin(_PluginBase):
     """WorkBuddy 每日自动签到"""
 
     # 插件元数据
     plugin_name = "WorkBuddyCheckin"
     plugin_desc = "WorkBuddy 每日自动签到，自动获取 100 积分，支持远程触发和通知推送。"
-    plugin_version = "1.0.0"
+    plugin_version = "1.1.0"
     plugin_author = "Cxquang"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/autosignin.png"
     plugin_order = 100
@@ -134,11 +141,25 @@ class WorkBuddyCheckin(_PluginBase):
             return {"title": "WorkBuddy签到失败", "text": "未配置 refreshToken"}
 
         try:
-            # 1. 刷新令牌
-            auth = self._refresh_token_api()
+            # 1. 刷新令牌（失效时抛 TokenInvalidError，走明确的重填提示）
+            try:
+                auth = self._refresh_token_api()
+            except TokenInvalidError as e:
+                return {
+                    "title": "WorkBuddy签到失败：refreshToken已失效",
+                    "text": (
+                        " refreshToken 已被服务端拒绝，无法自动续期。\n"
+                        "请重新提取 refreshToken 并到插件配置中更新！\n"
+                        "常见原因：\n"
+                        "1. WorkBuddy 客户端退出登录/换账号登录\n"
+                        "2. 其他设备（如本机计划任务）也在用同一账号签到，"
+                        "把 token 刷新走了——请只保留一处签到\n"
+                        f"接口返回：{e.detail or '未知'}"
+                    )
+                }
             if not auth or not auth.get("accessToken"):
                 return {"title": "WorkBuddy签到失败",
-                        "text": f"令牌刷新失败，refreshToken 可能已过期，请重新获取并更新配置"}
+                        "text": "令牌刷新异常（临时故障），下次定时任务会自动重试"}
 
             # 保存新 refreshToken（自动轮换续期）
             new_rt = auth.get("refreshToken", "")
@@ -193,9 +214,18 @@ class WorkBuddyCheckin(_PluginBase):
             f"{self._base_url}/v2/plugin/auth/token/refresh",
             headers=headers, json={}, timeout=30
         )
-        data = resp.json()
+        try:
+            data = resp.json()
+        except ValueError:
+            data = {}
+        # 判定令牌是否被服务端明确拒绝（HTTP 401/403，或业务码提示令牌无效）
+        if resp.status_code in (401, 403):
+            raise TokenInvalidError(f"HTTP {resp.status_code} {data.get('msg', '')}".strip())
         if resp.status_code == 200 and data.get("code") == 0:
             return data.get("data", {})
+        # 400/其他状态 + 非零业务码：大概率是令牌过期/非法（服务端不同错误路径返回不同状态码）
+        if data.get("code") not in (0, None):
+            raise TokenInvalidError(f"HTTP {resp.status_code} code={data.get('code')} {data.get('msg', '')}".strip())
         logger.error(f"WorkBuddyCheckin: 刷新令牌失败: {resp.status_code} {data}")
         return {}
 

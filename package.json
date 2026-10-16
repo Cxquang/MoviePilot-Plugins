@@ -60,12 +60,13 @@
     "name": "WorkBuddy每日签到",
     "description": "WorkBuddy(腾讯CodeBuddy)每日自动签到，自动获取100积分。支持定时签到、远程触发、签到结果推送到企业微信通知。refreshToken自动轮换续期，配置一次长期有效。",
     "labels": "签到管理",
-    "version": "1.0.0",
+    "version": "1.1.0",
     "icon": "Plugins_A.png",
     "author": "Cxquang",
     "level": 1,
     "v2": true,
     "history": {
+      "v1.1.0": "令牌失效明确识别：失效时推送重新填写 refreshToken 的指引通知（区分临时网络故障）；提示多设备签到冲突",
       "v1.0.0": "初始版本：支持定时签到、远程命令触发、API触发、Token自动轮换、企业微信通知"
     }
   }
