@@ -56,6 +56,19 @@
       "v1.4.0": "修复强制更改IP时配置面板延时过长的问题。庆祝v2进入正式版，显示了一个没用的参数"
     }
   },
+  "UrlNotify": {
+    "name": "URL消息通知",
+    "description": "外部服务通过URL调用向MoviePilot发送消息，由MoviePilot转发到企业微信等已配置的通知渠道。支持配置默认渠道、每次调用可指定渠道与消息类型，详情页展示调用方式与最近推送记录。",
+    "labels": "消息通知",
+    "version": "1.0.0",
+    "icon": "Wecom_A.png",
+    "author": "Cxquang",
+    "level": 1,
+    "v2": true,
+    "history": {
+      "v1.0.0": "初始版本：外部服务通过URL向MoviePilot推送消息并转发到企业微信等通知渠道；支持默认渠道配置、按次指定渠道/消息类型、GET/POST调用、最近消息记录"
+    }
+  },
   "WorkBuddyCheckin": {
     "name": "WorkBuddy每日签到",
     "description": "WorkBuddy(腾讯CodeBuddy)每日自动签到，自动获取100积分。支持定时签到、远程触发、签到结果推送到企业微信通知。refreshToken自动轮换续期，配置一次长期有效。",
