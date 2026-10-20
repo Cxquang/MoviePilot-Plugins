@@ -1,4 +1,17 @@
 {
+  "BotHostingRenew": {
+    "name": "Bot-Hosting自动续期",
+    "description": "Bot-Hosting.net 免费套餐自动续期（4天一期），到期自动续并推送通知，支持 Discord Token 自动换新登录",
+    "labels": "消息通知,站点",
+    "version": "1.0.0",
+    "icon": "https://bot-hosting.net/favicon.ico",
+    "author": "Cxquang",
+    "level": 1,
+    "v2": true,
+    "history": {
+      "v1.0.0": "初始版本：session_token 查询账单状态，到期自动调用官方续期接口（纯HTTP），session 失效自动 Discord OAuth 换新并回写，通知策略可选（每次/仅失败/关闭），详情页一键续期"
+    }
+  },
   "ExportMsg": {
     "name": "消息通知暴露",
     "description": "消息通知暴露给需要使用的服务，可以接收消息进一步处理",
