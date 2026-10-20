@@ -11,6 +11,7 @@
 参考与致谢：https://github.com/eooce/Auto-Renew-Bothosting
 """
 import re
+import threading
 import traceback
 from datetime import datetime, timezone, timedelta
 from typing import Any, List, Dict, Tuple, Optional
@@ -48,7 +49,7 @@ class BotHostingRenew(_PluginBase):
     # 插件图标
     plugin_icon = "https://bot-hosting.net/favicon.ico"
     # 插件版本
-    plugin_version = "1.0.0"
+    plugin_version = "1.1.0"
     # 插件作者
     plugin_author = "Cxquang"
     # 作者主页
@@ -68,6 +69,7 @@ class BotHostingRenew(_PluginBase):
     _cron = "0 8 * * *"
     _notify = NOTIFY_ALWAYS
     _renew_attempt = True
+    _onlyonce = False
     # 运行状态
     _last_result = None
 
@@ -80,6 +82,29 @@ class BotHostingRenew(_PluginBase):
             self._cron = (config.get("cron") or "0 8 * * *").strip()
             self._notify = config.get("notify") or NOTIFY_ALWAYS
             self._renew_attempt = config.get("renew_attempt", True)
+            self._onlyonce = config.get("onlyonce") or False
+            # 立即执行一次：开启并保存后触发，执行完自动关闭
+            if self._onlyonce:
+                self._onlyonce = False
+                self.__save_config(onlyonce=False)
+                if self.get_state():
+                    logger.info("Bot-Hosting 立即执行一次已触发，5 秒后台执行")
+                    threading.Timer(5.0, self.run_once).start()
+                else:
+                    logger.warn("Bot-Hosting 立即执行一次：插件未启用或未配置 Token，跳过")
+
+    def __save_config(self, onlyonce: bool = False):
+        """回写当前配置（保持字段齐全，避免丢项）"""
+        self.update_config({
+            "enabled": self._enabled,
+            "session_token": self._session_token,
+            "discord_token": self._discord_token,
+            "email": self._email,
+            "cron": self._cron,
+            "notify": self._notify,
+            "renew_attempt": self._renew_attempt,
+            "onlyonce": onlyonce,
+        })
 
     def get_state(self) -> bool:
         return self._enabled and bool(self._session_token or self._discord_token)
@@ -202,15 +227,7 @@ class BotHostingRenew(_PluginBase):
                 }
             # 保存新 token（自动续命，下次直接用）
             self._session_token = new_token
-            self.update_config({
-                "enabled": self._enabled,
-                "session_token": new_token,
-                "discord_token": self._discord_token,
-                "email": self._email,
-                "cron": self._cron,
-                "notify": self._notify,
-                "renew_attempt": self._renew_attempt,
-            })
+            self.__save_config()
             logger.info("Discord OAuth 登录成功，session_token 已自动更新")
             login_method = "Discord Token"
             status = self.__query_status(new_token)
@@ -625,6 +642,24 @@ class BotHostingRenew(_PluginBase):
                             },
                         ]
                     },
+                    # 立即执行一次
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12},
+                                "content": [{
+                                    "component": "VSwitch",
+                                    "props": {
+                                        "model": "onlyonce",
+                                        "label": "立即执行一次",
+                                        "placeholder": "开启并保存后立即执行一次（执行完自动关闭，用于验证配置）",
+                                    },
+                                }]
+                            },
+                        ]
+                    },
                     # 说明
                     {
                         "component": "VRow",
@@ -640,6 +675,8 @@ class BotHostingRenew(_PluginBase):
                                         "text": "Session Token 获取：浏览器登录 bot-hosting.net → F12 开发者工具 → 应用/存储 → Cookie → 复制 session_token 的值。"
                                                 "Discord Token 获取详见 eooce/Auto-Renew-Bothosting 项目说明；配置后 session 失效会自动走 OAuth 换新并回写。"
                                                 "免费套餐每 4 天需续期一次；插件先查询账单页状态，到可续期时间后调用官方续期接口。"
+                                                "修改配置后可开启「立即执行一次」验证配置是否有效，结果按通知策略推送，也可在详情页查看。"
+                                                "执行周期为 5 段 cron：分 时 日 月 周，如 0 8,20 * * * 表示每天 8 点和 20 点各执行一次。"
                                                 "若服务端强制 Turnstile 人机验证导致续期失败，将推送通知提醒手动处理。",
                                     },
                                 }]
@@ -656,6 +693,7 @@ class BotHostingRenew(_PluginBase):
             "cron": "0 8 * * *",
             "notify": NOTIFY_ALWAYS,
             "renew_attempt": True,
+            "onlyonce": False,
         }
 
     def get_page(self) -> List[dict]:

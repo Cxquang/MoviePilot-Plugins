@@ -3,12 +3,13 @@
     "name": "Bot-Hosting自动续期",
     "description": "Bot-Hosting.net 免费套餐自动续期（4天一期），到期自动续并推送通知，支持 Discord Token 自动换新登录",
     "labels": "消息通知,站点",
-    "version": "1.0.0",
+    "version": "1.1.0",
     "icon": "https://bot-hosting.net/favicon.ico",
     "author": "Cxquang",
     "level": 1,
     "v2": true,
     "history": {
+      "v1.1.0": "新增「立即执行一次」配置开关：修改配置后开启并保存即手动执行一次（执行完自动关闭），用于验证 Token 是否有效；配置说明补充 cron 格式与推荐周期",
       "v1.0.0": "初始版本：session_token 查询账单状态，到期自动调用官方续期接口（纯HTTP），session 失效自动 Discord OAuth 换新并回写，通知策略可选（每次/仅失败/关闭），详情页一键续期"
     }
   },
