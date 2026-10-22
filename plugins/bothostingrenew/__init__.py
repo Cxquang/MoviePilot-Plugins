@@ -42,6 +42,8 @@ CN_TZ = timezone(timedelta(hours=8))
 # 站点 DOM（真机确认）
 DIALOG_SELECTOR = "#renew-dialog"
 DIALOG_CONFIRM_SELECTOR = "#renew-dialog button.btn-primary"
+TURNSTILE_FRAME_SELECTOR = 'iframe[src*="challenges.cloudflare.com"]'
+TURNSTILE_API = "https://challenges.cloudflare.com/turnstile/v0/api.js"
 
 # 浏览器参数
 BROWSERS_PATH = "/config/.playwright"   # 持久化到 config 卷，重建容器不用重复下载
@@ -62,7 +64,7 @@ class BotHostingRenew(_PluginBase):
     # 插件图标
     plugin_icon = "https://bot-hosting.net/favicon.ico"
     # 插件版本
-    plugin_version = "1.2.1"
+    plugin_version = "1.2.2"
     # 插件作者
     plugin_author = "Cxquang"
     # 作者主页
@@ -309,10 +311,23 @@ class BotHostingRenew(_PluginBase):
             }
         else:
             err = renew_res.get("error") or "未知错误"
+            diag = renew_res.get("diagnostics")
+            diag_text = ""
+            if isinstance(diag, dict):
+                diag_text = ("\n现场诊断："
+                             f"token长度={diag.get('tokenLen')}，"
+                             f"响应输入框={diag.get('hasInput')}，"
+                             f"Turnstile组件={diag.get('hasWidget')}，"
+                             f"api.js可用={diag.get('hasApi')}，"
+                             f"确认按钮禁用={diag.get('confirmDisabled')}，"
+                             f"iframe={diag.get('iframes')}")
+            logs_text = ""
+            if renew_res.get("logs"):
+                logs_text = "\n执行日志：" + "；".join(renew_res.get("logs")[-6:])
             return {
                 "success": False,
                 "title": "自动续期失败",
-                "detail": f"失败原因：{err}\n"
+                "detail": f"失败原因：{err}{diag_text}{logs_text}\n"
                           "排查建议：\n"
                           "1. 确认容器可访问 bot-hosting.net 与 challenges.cloudflare.com（Turnstile 依赖后者）\n"
                           "2. 若服务器在墙内，请在插件配置中填写代理（http://user:pass@host:port）\n"
@@ -452,9 +467,12 @@ class BotHostingRenew(_PluginBase):
                     viewport={"width": 1366, "height": 900},
                     ignore_https_errors=True,
                 )
-                # 去掉自动化特征
+                # 去掉自动化特征（Cloudflare 会检测 webdriver/plugins 等）
                 context.add_init_script(
                     "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+                    "Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});"
+                    "Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});"
+                    "window.chrome = { runtime: {} };"
                 )
                 context.add_cookies([
                     {"name": "session_token", "value": session_token, "url": f"{BASE_URL}/"},
@@ -464,6 +482,7 @@ class BotHostingRenew(_PluginBase):
 
                 page = context.new_page()
                 page.set_default_timeout(30000)
+                log(f"Turnstile 资源连通性: {self.__check_turnstile_net()}")
                 log(f"打开账单页: {BILLINGS_URL}")
                 page.goto(BILLINGS_URL, wait_until="domcontentloaded", timeout=60000)
                 page.wait_for_timeout(1500)
@@ -496,7 +515,8 @@ class BotHostingRenew(_PluginBase):
                     snap = self.__turnstile_snapshot(page)
                     return {"ok": False,
                             "error": "Turnstile 验证未通过（cf-turnstile-response 一直为空）",
-                            "diagnostics": snap}
+                            "diagnostics": snap,
+                            "logs": logs[-10:]}
                 log(f"Turnstile 已通过（token 长度 {len(token)}），点击「Renew for 4 days」")
 
                 confirm = page.locator(DIALOG_CONFIRM_SELECTOR).first
@@ -602,6 +622,17 @@ class BotHostingRenew(_PluginBase):
 
     def __wait_turnstile(self, page, log) -> str:
         """轮询 cf-turnstile-response；为空时尝试点击复选框"""
+        # 先确认 Turnstile 组件本身是否加载出来
+        try:
+            page.locator(TURNSTILE_FRAME_SELECTOR).first.wait_for(state="attached", timeout=20000)
+            log("Turnstile 组件已加载")
+        except Exception:
+            log("Turnstile 组件 20 秒内未出现（challenges.cloudflare.com 可能未加载成功）")
+        try:
+            log(f"window.turnstile 是否可用: {page.evaluate('() => !!window.turnstile')}")
+        except Exception:
+            pass
+
         deadline = time.time() + TURNSTILE_WAIT
         last_click = 0.0
         attempt = 0
@@ -616,6 +647,16 @@ class BotHostingRenew(_PluginBase):
                 last_click = time.time()
             page.wait_for_timeout(1500)
         return ""
+
+    def __check_turnstile_net(self) -> str:
+        """从容器直接探测 Turnstile 脚本是否可达，便于定位网络/代理问题"""
+        try:
+            r = requests.get(TURNSTILE_API,
+                             headers={"User-Agent": USER_AGENT},
+                             proxies=self.__req_proxies(), timeout=15)
+            return f"HTTP {r.status_code}, {len(r.content)} bytes"
+        except Exception as e:
+            return f"失败: {e}"
 
     @staticmethod
     def __read_turnstile_token(page) -> str:
@@ -658,7 +699,7 @@ class BotHostingRenew(_PluginBase):
         for frame in page.frames:
             if "challenges.cloudflare.com" not in (frame.url or ""):
                 continue
-            for sel in ('input[type="checkbox"]', "#checkbox"):
+            for sel in ('input[type="checkbox"]', "#checkbox", 'label[for="checkbox"]'):
                 try:
                     loc = frame.locator(sel)
                     if loc.count():
@@ -666,6 +707,12 @@ class BotHostingRenew(_PluginBase):
                         return True
                 except Exception:
                     continue
+            # 复选框常在 iframe 左上角，坐标点击兜底
+            try:
+                frame.click("body", position={"x": 30, "y": 32}, timeout=3000)
+                return True
+            except Exception:
+                continue
         try:
             el = page.query_selector('iframe[src*="challenges.cloudflare.com"]')
             box = el.bounding_box() if el else None
@@ -689,6 +736,8 @@ class BotHostingRenew(_PluginBase):
                 hasInput: !!el,
                 tokenLen: el ? (el.value || '').length : -1,
                 confirmDisabled: btn ? !!btn.disabled : null,
+                hasWidget: !!document.querySelector('.cf-turnstile, [data-sitekey], iframe[src*="challenges.cloudflare.com"]'),
+                hasApi: !!window.turnstile,
                 iframes: Array.from(document.querySelectorAll('iframe'))
                     .map(f => f.src).slice(0, 5),
                 scripts: Array.from(document.querySelectorAll('script[src]'))
