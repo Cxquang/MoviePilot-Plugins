@@ -1,14 +1,15 @@
 {
   "BotHostingRenew": {
     "name": "Bot-Hosting自动续期",
-    "description": "Bot-Hosting.net 免费套餐自动续期（4天一期），浏览器模拟点击 + Turnstile 验证，支持 Discord Token 自动换新登录",
+    "description": "Bot-Hosting.net 免费套餐自动续期（4天一期）：账号密码优先，浏览器模拟点击过 Turnstile，失败转 GitHub Actions 兜底并推送通知",
     "labels": "消息通知,站点",
-    "version": "1.2.2",
+    "version": "1.3.0",
     "icon": "https://bot-hosting.net/favicon.ico",
     "author": "Cxquang",
     "level": 1,
     "v2": true,
     "history": {
+      "v1.3.0": "账号密码登录优先（登录页 Turnstile 已处理），距到期不足 24 小时才续期；浏览器失败可触发 Auto-Renew-Bothosting 的 workflow_dispatch 兜底，后台每分钟轮询 Action 状态，结束后推送企业微信并核对一次到期日",
       "v1.2.2": "Turnstile 失败诊断增强：通知里输出 token 长度、组件/ api.js 是否加载、iframe 列表和容器到 challenges.cloudflare.com 的连通性；点击策略增加 iframe 内坐标兜底",
       "v1.2.1": "修复 Playwright 注入 Cookie 报错（url 与 path 不能同时传）：改用 url 形式注入 session_token/login/theme",
       "v1.2.0": "续期改为浏览器模拟（Playwright + 无头 Chromium）：打开账单页点击「Renew free plan」，等待并处理 Turnstile 人机验证后点击「Renew for 4 days」；首次运行自动下载 Chromium 到 /config/.playwright；新增可选代理配置",
