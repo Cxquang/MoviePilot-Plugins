@@ -2,17 +2,22 @@
 """Bot-Hosting.net 自动续期插件
 
 移植自 eooce/Auto-Renew-Bothosting（GitHub Actions + SeleniumBase 方案），
-改为 MoviePilot 内运行的纯 HTTP 实现：
+改为 MoviePilot 内运行的浏览器自动化实现：
 1. session_token Cookie 访问账单页，解析订阅状态（到期/可续期时间）
-2. 到期前自动尝试 POST /api/billing/renew-free 续期（无需浏览器）
+2. 到可续期时间后，用 Playwright 启动 Chromium 模拟真人点击续期，
+   在弹窗中处理 Cloudflare Turnstile 人机验证，点击「Renew for 4 days」
 3. session_token 失效时，用 Discord Token 走 OAuth 流程自动换新（纯 HTTP）
 4. 执行结果通过 MP 消息渠道推送，通知策略可选
 
 参考与致谢：https://github.com/eooce/Auto-Renew-Bothosting
 """
+import os
 import re
+import sys
+import time
 import threading
 import traceback
+import subprocess
 from datetime import datetime, timezone, timedelta
 from typing import Any, List, Dict, Tuple, Optional
 
@@ -27,13 +32,21 @@ from app.schemas.types import EventType, NotificationType
 # 站点常量（来自前端逆向：PUBLIC_API_URL / PUBLIC_DISCORD_CLIENT_ID）
 BASE_URL = "https://bot-hosting.net"
 BILLINGS_URL = f"{BASE_URL}/a/billings"
-RENEW_API = f"{BASE_URL}/api/billing/renew-free"
 DISCORD_LOGIN_URL = f"{BASE_URL}/login/discord"
 DISCORD_CLIENT_ID = "884382422530158623"
 DISCORD_AUTHORIZE_API = "https://discord.com/api/v9/oauth2/authorize"
 USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
               "(KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36")
 CN_TZ = timezone(timedelta(hours=8))
+
+# 站点 DOM（真机确认）
+DIALOG_SELECTOR = "#renew-dialog"
+DIALOG_CONFIRM_SELECTOR = "#renew-dialog button.btn-primary"
+
+# 浏览器参数
+BROWSERS_PATH = "/config/.playwright"   # 持久化到 config 卷，重建容器不用重复下载
+TURNSTILE_WAIT = 120                    # 等待 Turnstile token 上限（秒）
+BROWSER_TOTAL_TIMEOUT = 330             # 整个浏览器流程上限（秒）
 
 # 通知策略
 NOTIFY_ALWAYS = "always"     # 每次执行都通知
@@ -45,11 +58,11 @@ class BotHostingRenew(_PluginBase):
     # 插件名称
     plugin_name = "Bot-Hosting自动续期"
     # 插件描述
-    plugin_desc = "Bot-Hosting.net 免费套餐自动续期（4天一期），到期自动续并推送通知，支持 Discord Token 自动换新登录"
+    plugin_desc = "Bot-Hosting.net 免费套餐自动续期（4天一期），浏览器模拟点击 + Turnstile 验证，支持 Discord Token 自动换新登录"
     # 插件图标
     plugin_icon = "https://bot-hosting.net/favicon.ico"
     # 插件版本
-    plugin_version = "1.1.0"
+    plugin_version = "1.2.0"
     # 插件作者
     plugin_author = "Cxquang"
     # 作者主页
@@ -69,6 +82,7 @@ class BotHostingRenew(_PluginBase):
     _cron = "0 8 * * *"
     _notify = NOTIFY_ALWAYS
     _renew_attempt = True
+    _proxy = ""
     _onlyonce = False
     # 运行状态
     _last_result = None
@@ -82,6 +96,7 @@ class BotHostingRenew(_PluginBase):
             self._cron = (config.get("cron") or "0 8 * * *").strip()
             self._notify = config.get("notify") or NOTIFY_ALWAYS
             self._renew_attempt = config.get("renew_attempt", True)
+            self._proxy = (config.get("proxy") or "").strip()
             self._onlyonce = config.get("onlyonce") or False
             # 立即执行一次：开启并保存后触发，执行完自动关闭
             if self._onlyonce:
@@ -103,6 +118,7 @@ class BotHostingRenew(_PluginBase):
             "cron": self._cron,
             "notify": self._notify,
             "renew_attempt": self._renew_attempt,
+            "proxy": self._proxy,
             "onlyonce": onlyonce,
         })
 
@@ -242,6 +258,16 @@ class BotHostingRenew(_PluginBase):
         expiry = status.get("expiry") or "（未获取到）"
         opens_at = status.get("opens_at")
 
+        # 网络/接口异常且未解析到任何页面数据时，直接报错，避免无意义地启动浏览器
+        if status.get("error") and not status.get("expiry"):
+            return {
+                "success": False,
+                "title": "状态查询失败",
+                "detail": f"{status.get('error')}\n"
+                          "容器无法访问 bot-hosting.net，请检查网络或填写代理。",
+                "time": self.__now_str(),
+            }
+
         # 2. 判断是否到了可续期时间
         if opens_at:
             opens_dt = self.__parse_time(opens_at)
@@ -276,20 +302,22 @@ class BotHostingRenew(_PluginBase):
             return {
                 "success": True,
                 "title": "续期成功 +4 天",
-                "detail": f"续期方式：API 直连\n新到期时间：{new_expiry}",
+                "detail": f"续期方式：浏览器模拟点击（Playwright）\n新到期时间：{new_expiry}",
                 "expiry": new_expiry,
                 "login_method": login_method,
                 "time": self.__now_str(),
             }
         else:
-            # 失败（大概率 Turnstile 服务端校验）
             err = renew_res.get("error") or "未知错误"
             return {
                 "success": False,
                 "title": "自动续期失败",
-                "detail": f"接口返回：{err}\n"
-                          "常见原因：服务端要求 Turnstile 人机验证（纯 API 方式无法生成验证令牌）。\n"
-                          "请手动登录 bot-hosting.net 点击续期，或继续使用浏览器自动化方案。",
+                "detail": f"失败原因：{err}\n"
+                          "排查建议：\n"
+                          "1. 确认容器可访问 bot-hosting.net 与 challenges.cloudflare.com（Turnstile 依赖后者）\n"
+                          "2. 若服务器在墙内，请在插件配置中填写代理（http://user:pass@host:port）\n"
+                          "3. 首次运行需联网下载 Chromium（约 150MB），失败可查看容器日志重试\n"
+                          "4. 仍失败时请手动登录续期一次。",
                 "expiry": expiry,
                 "login_method": login_method,
                 "time": self.__now_str(),
@@ -310,6 +338,7 @@ class BotHostingRenew(_PluginBase):
                 BILLINGS_URL,
                 headers={"User-Agent": USER_AGENT, "Accept": "text/html"},
                 cookies={"session_token": session_token, "login": "true", "theme": "system"},
+                proxies=self.__req_proxies(),
                 timeout=30, allow_redirects=False,
             )
         except Exception as e:
@@ -347,36 +376,351 @@ class BotHostingRenew(_PluginBase):
         return m.group(1) if m else None
 
     def __do_renew(self, session_token: str) -> dict:
-        """调用续期 API（turnstileToken 为空尝试）"""
-        try:
-            res = requests.post(
-                RENEW_API,
-                headers={
-                    "User-Agent": USER_AGENT,
-                    "Content-Type": "application/json",
-                    "Origin": BASE_URL,
-                    "Referer": BILLINGS_URL,
-                    "Accept": "application/json",
-                },
-                cookies={"session_token": session_token, "login": "true"},
-                json={"turnstileToken": ""},
-                timeout=30,
-            )
-        except Exception as e:
-            return {"ok": False, "error": f"网络异常: {e}"}
-        if res.status_code == 200:
+        """浏览器续期入口
+
+        MoviePilot 的 /run 接口运行在 asyncio 事件循环线程里，而 Playwright
+        同步 API 禁止在事件循环线程中使用，因此单独开线程执行再等结果。
+        """
+        outcome: Dict[str, Any] = {}
+
+        def _worker():
             try:
-                data = res.json()
-                if data.get("error"):
-                    return {"ok": False, "error": data.get("error")}
-                return {"ok": True, "data": data}
-            except ValueError:
-                return {"ok": True, "data": res.text[:200]}
+                outcome.update(self.__browser_renew(session_token))
+            except Exception as e:
+                logger.error(f"[BotHosting] 浏览器续期异常: {e}\n{traceback.format_exc()}")
+                outcome.update({"ok": False, "error": f"浏览器续期异常: {e}"})
+
+        t = threading.Thread(target=_worker, name="BotHostingRenew", daemon=True)
+        t.start()
+        t.join(timeout=BROWSER_TOTAL_TIMEOUT)
+        if t.is_alive():
+            return {"ok": False,
+                    "error": f"浏览器续期超时（{BROWSER_TOTAL_TIMEOUT}s），"
+                             "多半是容器网络无法访问 challenges.cloudflare.com，或被 Cloudflare 风控"}
+        return outcome or {"ok": False, "error": "浏览器续期未返回结果"}
+
+    def __browser_renew(self, session_token: str) -> dict:
+        """Playwright 模拟真人：打开账单页 -> 点续期 -> 过 Turnstile -> 点确认"""
+        self.__prepare_browser_env()
         try:
-            err = res.json().get("error") or res.text[:200]
-        except ValueError:
-            err = res.text[:200]
-        return {"ok": False, "error": f"HTTP {res.status_code}: {err}"}
+            from playwright.sync_api import sync_playwright
+        except ImportError:
+            return {"ok": False,
+                    "error": "未安装 playwright 库，请在容器内执行：pip install playwright"}
+
+        logs: List[str] = []
+
+        def log(msg: str):
+            logger.info(f"[BotHosting] {msg}")
+            logs.append(msg)
+
+        launch_kwargs: Dict[str, Any] = {
+            "headless": True,
+            "args": [
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-blink-features=AutomationControlled",
+                "--disable-gpu",
+                "--no-first-run",
+                "--no-default-browser-check",
+                "--lang=en-US",
+            ],
+        }
+        if self._proxy:
+            launch_kwargs["proxy"] = {"server": self._proxy}
+            log(f"使用代理: {self.__mask_proxy(self._proxy)}")
+
+        browser = None
+        try:
+            with sync_playwright() as p:
+                log("启动 Chromium...")
+                try:
+                    browser = p.chromium.launch(**launch_kwargs)
+                except Exception as e:
+                    msg = str(e)
+                    if "Executable doesn't exist" in msg or "playwright install" in msg:
+                        log("Chromium 未安装，开始下载（首次约 150MB，存放在 "
+                            f"{os.environ.get('PLAYWRIGHT_BROWSERS_PATH')}）...")
+                        self.__install_chromium()
+                        browser = p.chromium.launch(**launch_kwargs)
+                    else:
+                        raise
+
+                context = browser.new_context(
+                    user_agent=USER_AGENT,
+                    locale="en-US",
+                    viewport={"width": 1366, "height": 900},
+                    ignore_https_errors=True,
+                )
+                # 去掉自动化特征
+                context.add_init_script(
+                    "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+                )
+                context.add_cookies([
+                    {"name": "session_token", "value": session_token, "url": BASE_URL, "path": "/"},
+                    {"name": "login", "value": "true", "url": BASE_URL, "path": "/"},
+                    {"name": "theme", "value": "system", "url": BASE_URL, "path": "/"},
+                ])
+
+                page = context.new_page()
+                page.set_default_timeout(30000)
+                log(f"打开账单页: {BILLINGS_URL}")
+                page.goto(BILLINGS_URL, wait_until="domcontentloaded", timeout=60000)
+                page.wait_for_timeout(1500)
+                log(f"当前地址: {page.url}")
+                if "/login" in page.url:
+                    return {"ok": False, "need_relogin": True,
+                            "error": "session_token 已失效（被重定向到登录页）"}
+
+                renew_btn = self.__find_renew_button(page)
+                if renew_btn is None:
+                    return {"ok": False,
+                            "error": "账单页未找到可用的续期按钮（可能尚未到可续期时间，或页面结构变化）"}
+                try:
+                    if not renew_btn.is_enabled():
+                        return {"ok": False, "error": "续期按钮当前不可用（尚未到可续期时间/冷却中）"}
+                except Exception:
+                    pass
+                log("找到续期按钮，点击打开弹窗...")
+                renew_btn.click()
+
+                try:
+                    page.wait_for_selector(DIALOG_SELECTOR, state="visible", timeout=15000)
+                except Exception:
+                    return {"ok": False, "error": "点击续期后弹窗未出现",
+                            "diagnostics": self.__turnstile_snapshot(page)}
+                log("续期弹窗已出现，开始处理 Turnstile 验证...")
+
+                token = self.__wait_turnstile(page, log)
+                if not token:
+                    snap = self.__turnstile_snapshot(page)
+                    return {"ok": False,
+                            "error": "Turnstile 验证未通过（cf-turnstile-response 一直为空）",
+                            "diagnostics": snap}
+                log(f"Turnstile 已通过（token 长度 {len(token)}），点击「Renew for 4 days」")
+
+                confirm = page.locator(DIALOG_CONFIRM_SELECTOR).first
+                api_ok = True
+                api_msg = ""
+                try:
+                    with page.expect_response(
+                            lambda r: "/api/billing/renew-free" in r.url
+                                      and r.request.method == "POST",
+                            timeout=60000) as resp_info:
+                        confirm.click()
+                    resp = resp_info.value
+                    log(f"续期接口返回: HTTP {resp.status}")
+                    try:
+                        data = resp.json()
+                    except Exception:
+                        data = {}
+                    err = data.get("error") if isinstance(data, dict) else None
+                    if resp.status >= 400 or err:
+                        api_ok = False
+                        api_msg = str(err or f"HTTP {resp.status}")
+                except Exception as e:
+                    # 没抓到接口响应时用页面结果兜底
+                    log(f"未捕获续期接口响应: {e}")
+
+                if not api_ok:
+                    return {"ok": False, "error": f"续期接口返回失败: {api_msg}",
+                            "diagnostics": self.__turnstile_snapshot(page)}
+
+                log("续期请求已提交，刷新账单页确认新到期时间...")
+                page.wait_for_timeout(1500)
+                try:
+                    page.reload(wait_until="domcontentloaded", timeout=60000)
+                    page.wait_for_timeout(1500)
+                except Exception as e:
+                    log(f"刷新账单页失败（忽略）: {e}")
+                new_expiry = self.__read_expiry_from_page(page)
+                log(f"续期后到期时间: {new_expiry or '未解析到'}")
+                return {"ok": True, "expiry": new_expiry, "logs": logs[-10:]}
+        except Exception as e:
+            logger.error(f"[BotHosting] 浏览器流程失败: {e}\n{traceback.format_exc()}")
+            return {"ok": False, "error": f"浏览器流程失败: {e}", "logs": logs[-10:]}
+        finally:
+            if browser:
+                try:
+                    browser.close()
+                except Exception:
+                    pass
+
+    # ---------------------- 浏览器辅助方法 ----------------------
+
+    @staticmethod
+    def __prepare_browser_env() -> str:
+        """设置浏览器持久化目录（/moviepilot 非卷，/config 是卷）"""
+        path = os.environ.get("PLAYWRIGHT_BROWSERS_PATH") or BROWSERS_PATH
+        os.environ["PLAYWRIGHT_BROWSERS_PATH"] = path
+        try:
+            os.makedirs(path, exist_ok=True)
+        except Exception:
+            pass
+        return path
+
+    def __install_chromium(self):
+        """运行时安装 Chromium（镜像未内置浏览器二进制）"""
+        env = os.environ.copy()
+        env["PLAYWRIGHT_BROWSERS_PATH"] = self.__prepare_browser_env()
+        proc = subprocess.run(
+            [sys.executable, "-m", "playwright", "install", "chromium"],
+            env=env, capture_output=True, text=True, timeout=600,
+        )
+        if proc.returncode != 0:
+            detail = (proc.stderr or proc.stdout or "")[-500:]
+            raise RuntimeError(f"Chromium 下载失败（code={proc.returncode}）：{detail}")
+        logger.info(f"[BotHosting] Chromium 下载完成: {env['PLAYWRIGHT_BROWSERS_PATH']}")
+
+    def __find_renew_button(self, page):
+        """按文案定位外部续期按钮"""
+        selectors = [
+            'button:has-text("Renew free plan")',
+            'button:has-text("续期免费")',
+            'button:has-text("Renew")',
+            'main button.btn-primary',
+            'button.btn-primary',
+        ]
+        for sel in selectors:
+            try:
+                loc = page.locator(sel)
+                count = loc.count()
+            except Exception:
+                continue
+            for i in range(count):
+                btn = loc.nth(i)
+                try:
+                    if not btn.is_visible():
+                        continue
+                    text = (btn.inner_text() or "").strip()
+                except Exception:
+                    continue
+                low = text.lower()
+                if "renew" in low or "续期" in text:
+                    return btn
+        return None
+
+    def __wait_turnstile(self, page, log) -> str:
+        """轮询 cf-turnstile-response；为空时尝试点击复选框"""
+        deadline = time.time() + TURNSTILE_WAIT
+        last_click = 0.0
+        attempt = 0
+        while time.time() < deadline:
+            token = self.__read_turnstile_token(page)
+            if token:
+                return token
+            if attempt < 10 and time.time() - last_click >= 8:
+                attempt += 1
+                if self.__click_turnstile(page):
+                    log(f"第 {attempt} 次点击 Turnstile 复选框（token 仍为空）")
+                last_click = time.time()
+            page.wait_for_timeout(1500)
+        return ""
+
+    @staticmethod
+    def __read_turnstile_token(page) -> str:
+        js = """() => {
+            const el = document.querySelector('input[name="cf-turnstile-response"]');
+            return el ? (el.value || '') : '';
+        }"""
+        try:
+            val = page.evaluate(js) or ""
+            if val:
+                return val
+        except Exception:
+            pass
+        # 兜底：有些实现把 input 放进 iframe 内部
+        for frame in page.frames:
+            if "challenges.cloudflare.com" in (frame.url or ""):
+                try:
+                    val = frame.evaluate(js) or ""
+                    if val:
+                        return val
+                except Exception:
+                    continue
+        return ""
+
+    @staticmethod
+    def __click_turnstile(page) -> bool:
+        """点击 Turnstile 复选框：优先点 iframe 内 checkbox，其次按坐标点"""
+        try:
+            frame = page.frame_locator('iframe[src*="challenges.cloudflare.com"]')
+            for sel in ('input[type="checkbox"]', "#checkbox", 'label[for="checkbox"]'):
+                try:
+                    loc = frame.locator(sel)
+                    if loc.count():
+                        loc.first.click(timeout=3000)
+                        return True
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        for frame in page.frames:
+            if "challenges.cloudflare.com" not in (frame.url or ""):
+                continue
+            for sel in ('input[type="checkbox"]', "#checkbox"):
+                try:
+                    loc = frame.locator(sel)
+                    if loc.count():
+                        loc.first.click(timeout=3000)
+                        return True
+                except Exception:
+                    continue
+        try:
+            el = page.query_selector('iframe[src*="challenges.cloudflare.com"]')
+            box = el.bounding_box() if el else None
+            if box and box.get("width"):
+                page.mouse.click(box["x"] + box["width"] * 0.15,
+                                 box["y"] + box["height"] * 0.5)
+                return True
+        except Exception:
+            pass
+        return False
+
+    @staticmethod
+    def __turnstile_snapshot(page) -> dict:
+        """失败现场诊断信息，写进通知方便排查"""
+        js = """() => {
+            const dlg = document.querySelector('#renew-dialog');
+            const el = document.querySelector('input[name="cf-turnstile-response"]');
+            const btn = document.querySelector('#renew-dialog button.btn-primary');
+            return {
+                dialog: dlg ? (dlg.innerText || '').slice(0, 160) : '',
+                hasInput: !!el,
+                tokenLen: el ? (el.value || '').length : -1,
+                confirmDisabled: btn ? !!btn.disabled : null,
+                iframes: Array.from(document.querySelectorAll('iframe'))
+                    .map(f => f.src).slice(0, 5),
+                scripts: Array.from(document.querySelectorAll('script[src]'))
+                    .map(s => s.src).filter(s => s.includes('turnstile')).slice(0, 5),
+            };
+        }"""
+        try:
+            return page.evaluate(js)
+        except Exception as e:
+            return {"snapshot_error": str(e)}
+
+    def __read_expiry_from_page(self, page) -> Optional[str]:
+        """从当前页面 HTML 中提取到期时间（优先 SSR JSON）"""
+        try:
+            html = page.content()
+        except Exception:
+            return None
+        val = self.__extract_json_str(html, "freeRenewalDueAt")
+        if val:
+            return val
+        m = re.search(r"Expires\s*[:\-]?\s*(\d{4}/\d{2}/\d{2})", html)
+        return m.group(1) if m else None
+
+    @staticmethod
+    def __mask_proxy(proxy: str) -> str:
+        """代理地址脱敏，避免日志泄露账号密码"""
+        return re.sub(r"//([^:@/]+):([^@/]+)@", r"//\1:***@", proxy)
+
+    def __req_proxies(self) -> Optional[dict]:
+        if not self._proxy:
+            return None
+        return {"http": self._proxy, "https": self._proxy}
 
     def __discord_login(self) -> Optional[str]:
         """Discord OAuth 纯 HTTP 登录，成功返回新 session_token
@@ -389,6 +733,7 @@ class BotHostingRenew(_PluginBase):
         try:
             # 1. 获取 state
             r1 = requests.get(DISCORD_LOGIN_URL, headers={"User-Agent": USER_AGENT},
+                              proxies=self.__req_proxies(),
                               timeout=30, allow_redirects=False)
             if r1.status_code not in (301, 302, 303, 307):
                 logger.error(f"Bot-Hosting Discord 登录页异常: HTTP {r1.status_code}")
@@ -429,6 +774,7 @@ class BotHostingRenew(_PluginBase):
                         "channel_type": 10000,
                     },
                 },
+                proxies=self.__req_proxies(),
                 timeout=30,
             )
             if r2.status_code != 200:
@@ -442,6 +788,7 @@ class BotHostingRenew(_PluginBase):
             # 3. 回调捕获 session_token
             sess = requests.Session()
             sess.headers.update({"User-Agent": USER_AGENT})
+            sess.proxies.update(self.__req_proxies() or {})
             r3 = sess.get(callback, timeout=30)
             if "/error/banned" in r3.url:
                 logger.error("Bot-Hosting 账号已被封禁")
@@ -620,6 +967,24 @@ class BotHostingRenew(_PluginBase):
                             },
                         ]
                     },
+                    # 代理（可选）
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 8},
+                                "content": [{
+                                    "component": "VTextField",
+                                    "props": {
+                                        "model": "proxy",
+                                        "label": "代理（可选）",
+                                        "placeholder": "http://user:pass@host:port，留空直连",
+                                    },
+                                }]
+                            },
+                        ]
+                    },
                     # 通知策略
                     {
                         "component": "VRow",
@@ -674,10 +1039,13 @@ class BotHostingRenew(_PluginBase):
                                         "variant": "tonal",
                                         "text": "Session Token 获取：浏览器登录 bot-hosting.net → F12 开发者工具 → 应用/存储 → Cookie → 复制 session_token 的值。"
                                                 "Discord Token 获取详见 eooce/Auto-Renew-Bothosting 项目说明；配置后 session 失效会自动走 OAuth 换新并回写。"
-                                                "免费套餐每 4 天需续期一次；插件先查询账单页状态，到可续期时间后调用官方续期接口。"
+                                                "免费套餐每 4 天需续期一次；到可续期时间后，插件用 Playwright 无头 Chromium 打开账单页，"
+                                                "模拟点击「Renew free plan」，通过 Turnstile 人机验证后点击「Renew for 4 days」。"
+                                                "首次运行会自动下载 Chromium（约 150MB），保存在 /config/.playwright，之后不再重复下载。"
+                                                "容器必须能访问 bot-hosting.net 与 challenges.cloudflare.com（Turnstile 依赖后者）；"
+                                                "若服务器在国内或网络受限，请在下方填写代理。"
                                                 "修改配置后可开启「立即执行一次」验证配置是否有效，结果按通知策略推送，也可在详情页查看。"
-                                                "执行周期为 5 段 cron：分 时 日 月 周，如 0 8,20 * * * 表示每天 8 点和 20 点各执行一次。"
-                                                "若服务端强制 Turnstile 人机验证导致续期失败，将推送通知提醒手动处理。",
+                                                "执行周期为 5 段 cron：分 时 日 月 周，如 0 8,20 * * * 表示每天 8 点和 20 点各执行一次。",
                                     },
                                 }]
                             },
@@ -693,6 +1061,7 @@ class BotHostingRenew(_PluginBase):
             "cron": "0 8 * * *",
             "notify": NOTIFY_ALWAYS,
             "renew_attempt": True,
+            "proxy": "",
             "onlyonce": False,
         }
 

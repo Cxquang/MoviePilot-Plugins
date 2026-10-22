@@ -1,14 +1,15 @@
 {
   "BotHostingRenew": {
     "name": "Bot-Hosting自动续期",
-    "description": "Bot-Hosting.net 免费套餐自动续期（4天一期），到期自动续并推送通知，支持 Discord Token 自动换新登录",
+    "description": "Bot-Hosting.net 免费套餐自动续期（4天一期），浏览器模拟点击 + Turnstile 验证，支持 Discord Token 自动换新登录",
     "labels": "消息通知,站点",
-    "version": "1.1.0",
+    "version": "1.2.0",
     "icon": "https://bot-hosting.net/favicon.ico",
     "author": "Cxquang",
     "level": 1,
     "v2": true,
     "history": {
+      "v1.2.0": "续期改为浏览器模拟（Playwright + 无头 Chromium）：打开账单页点击「Renew free plan」，等待并处理 Turnstile 人机验证后点击「Renew for 4 days」；首次运行自动下载 Chromium 到 /config/.playwright；新增可选代理配置",
       "v1.1.0": "新增「立即执行一次」配置开关：修改配置后开启并保存即手动执行一次（执行完自动关闭），用于验证 Token 是否有效；配置说明补充 cron 格式与推荐周期",
       "v1.0.0": "初始版本：session_token 查询账单状态，到期自动调用官方续期接口（纯HTTP），session 失效自动 Discord OAuth 换新并回写，通知策略可选（每次/仅失败/关闭），详情页一键续期"
     }
