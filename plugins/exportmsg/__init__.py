@@ -20,7 +20,7 @@ class ExportMsg(_PluginBase):
     # 插件图标
     plugin_icon = "Plugins_A.png"
     # 插件版本
-    plugin_version = "1.07"
+    plugin_version = "1.06"
     # 插件作者
     plugin_author = "Cxquang"
     # 作者主页
@@ -539,28 +539,11 @@ class ExportMsg(_PluginBase):
         """推送到外部服务，返回 (是否成功, 结果说明)"""
         try:
             sc_url = self._url
-            # 统一先按保存的 URL 发；命中 "plain HTTP on HTTPS port" 时自动把 scheme 升级为 https 重试一次
             logger.info(sc_url)
-            logger.debug(f"准备发送事件到 {sc_url}，数据：{event_info}")
-            res = RequestUtils(content_type="application/json").post_res(sc_url, json=event_info)
 
-            # ---- 命中 "plain HTTP request was sent to HTTPS port" 则升级 https 重试 ----
-            retry_url = None
-            if res is not None and res.status_code == 400 and sc_url.lower().startswith("http://"):
-                body = (res.text or "").lower()
-                if "plain http" in body and "https port" in body:
-                    retry_url = "https://" + sc_url[len("http://"):]
-            if retry_url:
-                logger.warn(f"检测到 {sc_url} 被 HTTPS 端口拒绝，自动升级为 {retry_url} 重试")
-                res = RequestUtils(content_type="application/json").post_res(retry_url, json=event_info)
-                if res is None:
-                    return False, (f"http/https 都连不上下游：升级 https 后仍无响应，"
-                                   f"请确认 {retry_url} 是否可达")
-                if res.status_code != 200:
-                    return False, (f"升级为 https 后依然失败（{res.status_code}），响应："
-                                   f"{(res.text or '')[:200]}；请把插件配置里的接收地址直接改成 https:// 开头")
-                sc_url = retry_url
-                self._url = retry_url  # 顺手回写运行时地址，本次会话后续事件也走 https
+            # 调试日志
+            logger.debug(f"准备发送事件到 {self._url}，数据：{event_info}")
+            res = RequestUtils(content_type="application/json").post_res(sc_url, json=event_info)
 
             # 检查响应是否存在
             if res is None:
@@ -574,17 +557,7 @@ class ExportMsg(_PluginBase):
             # 检查HTTP状态码
             if res.status_code != 200:
                 logger.error(f"请求失败，状态码：{res.status_code}")
-                hint = ""
-                body_lower = (res.text or "").lower()
-                if "plain http" in body_lower and "https port" in body_lower:
-                    hint = "；疑似 http 打到 HTTPS 端口，请把接收地址改成 https:// 开头"
-                elif "handshake failure" in body_lower or "ssl" in body_lower and "error" in body_lower:
-                    hint = "；可能是 https 证书问题，请换 http 或检查证书"
-                elif res.status_code in (401, 403):
-                    hint = "；下游拒绝访问，请检查鉴权"
-                elif res.status_code == 404:
-                    hint = "；路径不存在，请核对接收地址的接口路径"
-                return False, f"请求失败，HTTP 状态码：{res.status_code}，响应：{(res.text or '')[:200]}{hint}"
+                return False, f"请求失败，HTTP 状态码：{res.status_code}，响应：{(res.text or '')[:200]}"
 
             # 检查响应体是否为空
             if not res.text.strip():
