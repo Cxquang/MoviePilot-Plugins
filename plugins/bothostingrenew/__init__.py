@@ -62,7 +62,7 @@ class BotHostingRenew(_PluginBase):
     # 插件图标
     plugin_icon = "https://bot-hosting.net/favicon.ico"
     # 插件版本
-    plugin_version = "1.2.0"
+    plugin_version = "1.2.1"
     # 插件作者
     plugin_author = "Cxquang"
     # 作者主页
@@ -457,9 +457,9 @@ class BotHostingRenew(_PluginBase):
                     "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
                 )
                 context.add_cookies([
-                    {"name": "session_token", "value": session_token, "url": BASE_URL, "path": "/"},
-                    {"name": "login", "value": "true", "url": BASE_URL, "path": "/"},
-                    {"name": "theme", "value": "system", "url": BASE_URL, "path": "/"},
+                    {"name": "session_token", "value": session_token, "url": f"{BASE_URL}/"},
+                    {"name": "login", "value": "true", "url": f"{BASE_URL}/"},
+                    {"name": "theme", "value": "system", "url": f"{BASE_URL}/"},
                 ])
 
                 page = context.new_page()
