@@ -43,7 +43,7 @@ class WorkBuddyCheckin(_PluginBase):
     # 插件元数据
     plugin_name = "WorkBuddyCheckin"
     plugin_desc = "WorkBuddy 与 Trae 每日自动签到：自动领取积分，支持设置页保存后立即执行一次、定时签到、远程触发、消息通知策略。"
-    plugin_version = "1.4.0"
+    plugin_version = "1.4.1"
     plugin_author = "Cxquang"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/autosignin.png"
     plugin_order = 100
@@ -255,12 +255,49 @@ class WorkBuddyCheckin(_PluginBase):
             logger.error(f"WorkBuddyCheckin: cron 表达式不正确({self._cron}): {e}")
             return []
 
+    def _run_with_timeout(self, label: str, func, timeout: int, prefix: str) -> dict:
+        """独立线程执行单个签到任务：超时直接返回失败结果，避免整体流程与通知被卡死
+
+        requests 的 timeout 不覆盖 DNS 解析，容器内 DNS 异常时请求可能无限期挂起，
+        因此这里用线程 join 做硬超时兜底。
+        """
+        box = {}
+
+        def _worker():
+            try:
+                box["result"] = func()
+            except Exception as e:
+                box["error"] = e
+
+        thread = threading.Thread(
+            target=_worker, name=f"WorkBuddyCheckin-{label}", daemon=True
+        )
+        thread.start()
+        thread.join(timeout)
+        if thread.is_alive():
+            logger.error(
+                f"WorkBuddyCheckin: {label} 签到超过 {timeout}s 未返回，判定超时"
+                f"（通常是 MoviePilot 容器的网络/DNS 无法访问目标站点）"
+            )
+            return self._finish(
+                "timeout", f"{label}签到超时",
+                f"请求超过 {timeout} 秒未返回，通常是网络或 DNS 无法解析目标域名。\n"
+                f"请在 MoviePilot 容器内测试网络连通性后重试",
+                prefix=prefix,
+            )
+        if "error" in box:
+            logger.error(f"WorkBuddyCheckin: {label} 签到执行异常: {box['error']}")
+            return self._finish("error", f"{label}签到异常", f"异常: {box['error']}", prefix=prefix)
+        return box.get("result") or self._finish(
+            "error", f"{label}签到异常", "无返回结果", prefix=prefix
+        )
+
     def _collect_checkin_results(self) -> List[dict]:
         """按启用情况依次执行签到，返回结果列表，并把每一步写入插件日志"""
         results = []
         if self._enabled and self._refresh_token:
             logger.info("WorkBuddyCheckin: 开始执行 WorkBuddy 签到")
-            result = self._do_checkin()
+            result = self._run_with_timeout("WorkBuddy", self._do_checkin, 120, "checkin")
             logger.info(
                 f"WorkBuddyCheckin: WorkBuddy 签到结果 -> {result.get('status')} | "
                 f"{(result.get('text') or '').splitlines()[0] if result.get('text') else ''}"
@@ -271,7 +308,7 @@ class WorkBuddyCheckin(_PluginBase):
 
         if self._trae_enabled and (self._trae_access_token or self._trae_refresh_token):
             logger.info("WorkBuddyCheckin: 开始执行 Trae 签到")
-            result = self._trae_do_checkin()
+            result = self._run_with_timeout("Trae", self._trae_do_checkin, 150, "trae")
             logger.info(
                 f"WorkBuddyCheckin: Trae 签到结果 -> {result.get('status')} | "
                 f"{(result.get('text') or '').splitlines()[0] if result.get('text') else ''}"
@@ -485,6 +522,7 @@ class WorkBuddyCheckin(_PluginBase):
         if not self._trae_uid:
             raise TokenInvalidError("未配置 Trae User ID（x-uid）")
         client_id = self._trae_client_id or TRAE_CLIENT_ID
+        logger.info("WorkBuddyCheckin: 请求 Trae ExchangeToken 接口（ClientID=%s）" % client_id)
         resp = self._session.post(
             f"{self._trae_host}/cloudide/api/v3/trae/oauth/ExchangeToken",
             headers={"Content-Type": "application/json", "Accept": "application/json"},
@@ -494,7 +532,7 @@ class WorkBuddyCheckin(_PluginBase):
                 "ClientSecret": "-",
                 "UserID": self._trae_uid,
             },
-            timeout=30,
+            timeout=(5, 20),
         )
         try:
             data = resp.json()
@@ -533,14 +571,19 @@ class WorkBuddyCheckin(_PluginBase):
 
     def _trae_get_status(self, access_token: str) -> dict:
         """查询 Trae 今日签到状态"""
+        logger.info("WorkBuddyCheckin: 请求 Trae 状态接口 .../checkin_credits/status")
         resp = self._session.post(
             f"{self._trae_host}/trae/api/v2/ug/checkin_credits/status",
-            headers=self._trae_headers(access_token), json={}, timeout=30
+            headers=self._trae_headers(access_token), json={}, timeout=(5, 20)
         )
         try:
             data = resp.json()
         except ValueError:
             data = {}
+        logger.info(
+            f"WorkBuddyCheckin: Trae 状态接口返回 HTTP {resp.status_code} "
+            f"code={data.get('code')} checked_in={data.get('checked_in')}"
+        )
         if resp.status_code in (401, 403):
             raise TokenInvalidError(f"HTTP {resp.status_code} {data.get('message', '')}".strip())
         return data
@@ -549,14 +592,19 @@ class WorkBuddyCheckin(_PluginBase):
         """调用 Trae 领取签到积分接口，对 9074 限流做指数退避重试"""
         data = {}
         for attempt in range(3):
+            logger.info(f"WorkBuddyCheckin: 请求 Trae 领取接口（第 {attempt + 1}/3 次）")
             resp = self._session.post(
                 f"{self._trae_host}/trae/api/v2/ug/checkin_credits/claim",
-                headers=self._trae_headers(access_token), json={}, timeout=30
+                headers=self._trae_headers(access_token), json={}, timeout=(5, 20)
             )
             try:
                 data = resp.json()
             except ValueError:
                 data = {}
+            logger.info(
+                f"WorkBuddyCheckin: Trae 领取接口返回 HTTP {resp.status_code} "
+                f"code={data.get('code')} message={data.get('message', '')}"
+            )
             if resp.status_code in (401, 403):
                 raise TokenInvalidError(f"HTTP {resp.status_code} {data.get('message', '')}".strip())
             # 9074 = 参与用户太多，指数退避重试
@@ -661,10 +709,12 @@ class WorkBuddyCheckin(_PluginBase):
         """按通知策略通过 MoviePilot 消息渠道（如企业微信）推送签到结果，多服务合并为一条"""
         results = [r for r in results if r]
         if not results or self._notify_mode == "off":
+            logger.info("WorkBuddyCheckin: 通知策略为关闭或无结果，跳过通知")
             return
-        fail_status = ("fail", "token_invalid", "error", "no_token")
+        fail_status = ("fail", "token_invalid", "error", "no_token", "timeout")
         if self._notify_mode == "fail" and not any(
                 r.get("status") in fail_status for r in results):
+            logger.info("WorkBuddyCheckin: 通知策略为仅失败通知，本次全部成功，跳过通知")
             return
         if len(results) == 1:
             title = results[0].get("title") or "签到结果"
@@ -675,6 +725,7 @@ class WorkBuddyCheckin(_PluginBase):
                 f"{r.get('title', '')}\n{r.get('text', '')}".strip() for r in results)
         try:
             self.post_message(title=title, text=text)
+            logger.info(f"WorkBuddyCheckin: 通知已发送 -> {title}")
         except Exception as e:
             logger.error(f"WorkBuddyCheckin: 发送通知失败: {e}")
 
