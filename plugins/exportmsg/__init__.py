@@ -1,8 +1,10 @@
 import json
+from datetime import datetime
 from typing import Any, List, Dict, Tuple
 
 import requests.exceptions
 
+from app.core.config import settings
 from app.core.event import eventmanager, Event
 from app.log import logger
 from app.plugins import _PluginBase
@@ -18,7 +20,7 @@ class ExportMsg(_PluginBase):
     # 插件图标
     plugin_icon = "Plugins_A.png"
     # 插件版本
-    plugin_version = "1.05"
+    plugin_version = "1.06"
     # 插件作者
     plugin_author = "Cxquang"
     # 作者主页
@@ -54,7 +56,67 @@ class ExportMsg(_PluginBase):
         pass
 
     def get_api(self) -> List[Dict[str, Any]]:
-        pass
+        return [{
+            "path": "/test",
+            "endpoint": self.api_test,
+            "methods": ["GET", "POST"],
+            "auth": "apikey",
+            "summary": "测试推送：模拟整理完成事件发送到接收地址",
+        }]
+
+    def api_test(self) -> Dict[str, Any]:
+        """
+        测试推送：构造一条模拟的整理完成事件，发送到已保存的接收地址
+        仅校验接收地址，不校验「整理完成事件」开关与消息类型筛选
+        """
+        if not self._url:
+            return {"code": 1, "msg": "请先填写「需要接收通知的地址」并保存配置"}
+
+        # 模拟的整理完成事件数据（结构与真实 TransferComplete 一致）
+        meta = {
+            "name": "测试剧集",
+            "year": "2024",
+            "begin_season": 1,
+            "end_season": 1,
+            "begin_episode": 1,
+            "end_episode": 1,
+            "type": "电视剧",
+        }
+        mediainfo = {
+            "title": "测试剧集",
+            "original_title": "Test Show",
+            "year": "2024",
+            "type": "电视剧",
+            "tmdb_id": "1000001",
+            "douban_id": "3000001",
+        }
+        transferinfo = {
+            "target_diritem": {"path": "/media/tv/测试剧集 (2024)/Season 01"},
+            "file_list_new": ["测试剧集 S01E01.mkv"],
+        }
+        fileitem = {"name": "测试剧集 S01E01.mkv"}
+
+        event_info = self.__build_transfer_event_info(meta, mediainfo, transferinfo, fileitem)
+        # 标记为测试消息，便于下游服务识别
+        event_info["test"] = True
+        event_info["title"] = f"【测试】{event_info['title']}"
+
+        logger.info(f"exportMsg测试推送 -> {self._url}")
+        success, msg = self.__forward(event_info)
+
+        self.save_data("last_test", {
+            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "url": self._url,
+            "success": success,
+            "msg": msg,
+            "title": event_info.get("title"),
+            "content": event_info.get("content"),
+        })
+        return {
+            "code": 0 if success else 1,
+            "msg": msg,
+            "data": event_info,
+        }
 
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
         """
@@ -139,6 +201,27 @@ class ExportMsg(_PluginBase):
                                 },
                                 'content': [
                                     {
+                                        'component': 'span',
+                                        'props': {
+                                            'class': 'text-medium-emphasis text-body-2'
+                                        },
+                                        'text': '保存配置后，可在插件详情页点击「发送测试（模拟整理完成事件）」按钮，'
+                                                '按已保存的地址推送一条示例整理完成事件，用于验证下游服务连通性',
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12
+                                },
+                                'content': [
+                                    {
                                         'component': 'VSelect',
                                         'props': {
                                             'multiple': True,
@@ -187,7 +270,95 @@ class ExportMsg(_PluginBase):
         }
 
     def get_page(self) -> List[dict]:
-        pass
+        """详情页：接收地址、开关状态、测试推送按钮与最近测试结果"""
+        last = self.get_data("last_test") or {}
+        content = [
+            {
+                'component': 'VRow',
+                'content': [
+                    {
+                        'component': 'VCol',
+                        'props': {'cols': 12, 'md': 6},
+                        'content': [
+                            {
+                                'component': 'VStat',
+                                'props': {
+                                    'name': '插件状态',
+                                    'value': '已启用' if self._enabled else '未启用',
+                                }
+                            }
+                        ]
+                    },
+                    {
+                        'component': 'VCol',
+                        'props': {'cols': 12, 'md': 6},
+                        'content': [
+                            {
+                                'component': 'VStat',
+                                'props': {
+                                    'name': '整理完成事件',
+                                    'value': '已开启' if self._enable_transfer else '已关闭',
+                                }
+                            }
+                        ]
+                    }
+                ]
+            },
+            {
+                'component': 'div',
+                'props': {'class': 'px-4 py-2 text-body-2'},
+                'text': f'接收地址：{self._url or "未配置"}',
+            },
+            {
+                'component': 'div',
+                'props': {'class': 'px-4 pb-2 text-medium-emphasis text-body-2'},
+                'text': '测试消息标题带「【测试】」前缀，payload 带 test=true，其余 title/content/event/media 字段与真实整理完成消息一致',
+            },
+        ]
+
+        if last:
+            last_content = str(last.get('content', '')).replace('\n', ' / ')
+            content.append({
+                'component': 'VAlert',
+                'props': {
+                    'type': 'success' if last.get('success') else 'error',
+                    'variant': 'tonal',
+                    'text': f"{last.get('time', '')} 测试结果：{last.get('msg', '')}"
+                            f"；标题：{last.get('title', '')}；内容：{last_content}",
+                }
+            })
+
+        content.append({
+            'component': 'VRow',
+            'content': [
+                {
+                    'component': 'VCol',
+                    'props': {'cols': 12},
+                    'content': [
+                        {
+                            'component': 'VBtn',
+                            'props': {
+                                'color': 'primary',
+                                'block': True,
+                                'prepend-icon': 'mdi-send-check',
+                                'text': '发送测试（模拟整理完成事件）',
+                            },
+                            'events': {
+                                'click': {
+                                    'api': f'plugin/ExportMsg/test?apikey={settings.API_TOKEN}',
+                                    'method': 'get',
+                                }
+                            },
+                        }
+                    ]
+                }
+            ]
+        })
+        return [{
+            'component': 'VCard',
+            'props': {'title': '消息通知暴露'},
+            'content': content,
+        }]
 
     @eventmanager.register(EventType.NoticeMessage)
     def send(self, event: Event):
@@ -260,6 +431,12 @@ class ExportMsg(_PluginBase):
         transferinfo = data.get("transferinfo")
         fileitem = data.get("fileitem")
 
+        event_info = self.__build_transfer_event_info(meta, mediainfo, transferinfo, fileitem)
+        logger.info(f"exportMsg整理完成事件触发：{event_info.get('title')}")
+        self.__forward(event_info)
+
+    def __build_transfer_event_info(self, meta, mediainfo, transferinfo, fileitem) -> dict:
+        """根据整理完成事件的数据拼装推送内容（真实事件与测试推送共用）"""
         # ---- 提取媒体信息（兼容对象/字典两种结构） ----
         media_title = self.__attr(mediainfo, "title") or self.__attr(meta, "name") or ""
         original_title = self.__attr(mediainfo, "original_title") or ""
@@ -321,8 +498,6 @@ class ExportMsg(_PluginBase):
             text_lines.append(f"文件：{file_name}")
         text = "\n".join(text_lines)
 
-        logger.info(f"exportMsg整理完成事件触发：{display_name or file_name}")
-
         # ---- 推送（附结构化媒体信息，供弹幕采集等下游服务直接使用） ----
         event_info = {
             "url": self._url,
@@ -349,7 +524,7 @@ class ExportMsg(_PluginBase):
         }
         if self._topic:
             event_info["topic"] = self._topic
-        self.__forward(event_info)
+        return event_info
 
     @staticmethod
     def __attr(obj, name: str, default=None):
@@ -360,10 +535,9 @@ class ExportMsg(_PluginBase):
             return obj.get(name, default)
         return getattr(obj, name, default)
 
-    def __forward(self, event_info: dict):
-        """推送到外部服务（原请求与响应处理逻辑）"""
+    def __forward(self, event_info: dict) -> tuple:
+        """推送到外部服务，返回 (是否成功, 结果说明)"""
         try:
-            # 构建url
             sc_url = self._url
             logger.info(sc_url)
 
@@ -374,7 +548,7 @@ class ExportMsg(_PluginBase):
             # 检查响应是否存在
             if res is None:
                 logger.error("请求失败：未收到响应")
-                return
+                return False, "请求失败：未收到响应（请检查地址是否可达）"
             # 记录详细日志
             logger.debug(f"响应状态码: {res.status_code}")
             logger.debug(f"响应头: {res.headers}")
@@ -383,28 +557,30 @@ class ExportMsg(_PluginBase):
             # 检查HTTP状态码
             if res.status_code != 200:
                 logger.error(f"请求失败，状态码：{res.status_code}")
-                return
+                return False, f"请求失败，HTTP 状态码：{res.status_code}，响应：{(res.text or '')[:200]}"
 
             # 检查响应体是否为空
             if not res.text.strip():
                 logger.error("响应内容为空")
-                return
+                return False, "请求成功但响应内容为空（下游接口未返回 meta 信息）"
 
             # 安全解析JSON
             try:
                 ret_json = res.json()
             except json.JSONDecodeError as e:
                 logger.error(f"JSON解析失败：{e}，响应内容：{res.text[:200]}...")
-                return
+                return False, f"响应不是合法 JSON：{(res.text or '')[:200]}"
             meta_ret = ret_json.get('meta') or {}
             code = meta_ret.get('status')
             msg = meta_ret.get('msg')
             if code == 200:
                 logger.info("export消息发送成功")
-            else:
-                logger.warn(f"export消息发送，接口返回失败，错误码：{code}，错误原因：{msg}")
+                return True, "发送成功，下游返回 status=200"
+            logger.warn(f"export消息发送，接口返回失败，错误码：{code}，错误原因：{msg}")
+            return False, f"下游接口返回失败，错误码：{code}，原因：{msg}"
         except requests.exceptions.RequestException as msg_e:
             logger.error(f"未知错误，{str(msg_e)}", exc_info=True)
+            return False, f"请求异常：{str(msg_e)}"
 
     def stop_service(self):
         """
