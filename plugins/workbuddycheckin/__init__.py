@@ -42,7 +42,7 @@ class WorkBuddyCheckin(_PluginBase):
     # 插件元数据
     plugin_name = "WorkBuddyCheckin"
     plugin_desc = "WorkBuddy 与 Trae 每日自动签到：自动领取积分，支持手动一键签到、远程触发、消息通知策略。"
-    plugin_version = "1.3.3"
+    plugin_version = "1.3.4"
     plugin_author = "Cxquang"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/autosignin.png"
     plugin_order = 100
@@ -153,25 +153,25 @@ class WorkBuddyCheckin(_PluginBase):
             "path": "/checkin",
             "endpoint": self.api_checkin,
             "methods": ["GET", "POST"],
-            "auth": "apikey",
+            "auth": "bear",
             "summary": "手动触发 WorkBuddy 签到"
         }, {
             "path": "/status",
             "endpoint": self.api_status,
             "methods": ["GET"],
-            "auth": "apikey",
+            "auth": "bear",
             "summary": "查询 WorkBuddy 签到状态"
         }, {
             "path": "/trae_checkin",
             "endpoint": self.api_trae_checkin,
             "methods": ["GET", "POST"],
-            "auth": "apikey",
+            "auth": "bear",
             "summary": "手动触发 Trae 签到"
         }, {
             "path": "/trae_status",
             "endpoint": self.api_trae_status,
             "methods": ["GET"],
-            "auth": "apikey",
+            "auth": "bear",
             "summary": "查询 Trae 签到状态"
         }]
 
