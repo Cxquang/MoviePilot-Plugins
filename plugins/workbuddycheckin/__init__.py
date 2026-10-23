@@ -6,8 +6,10 @@ WorkBuddy + Trae 每日自动签到插件
 支持：定时签到、详情页一键签到、远程命令/API 触发、消息通知策略配置。
 """
 import hashlib
+import json
 import platform
 import secrets
+import time
 import uuid
 from datetime import datetime
 from typing import List, Dict
@@ -40,7 +42,7 @@ class WorkBuddyCheckin(_PluginBase):
     # 插件元数据
     plugin_name = "WorkBuddyCheckin"
     plugin_desc = "WorkBuddy 与 Trae 每日自动签到：自动领取积分，支持手动一键签到、远程触发、消息通知策略。"
-    plugin_version = "1.3.0"
+    plugin_version = "1.3.1"
     plugin_author = "Cxquang"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/autosignin.png"
     plugin_order = 100
@@ -56,11 +58,13 @@ class WorkBuddyCheckin(_PluginBase):
     _session = None
     # Trae 配置
     _trae_enabled = False
+    _trae_access_token = ""   # 直接填入 accessToken 时优先使用，绕过 refreshToken 换 token
     _trae_refresh_token = ""
     _trae_uid = ""
     _trae_host = "https://api.trae.cn"
     _trae_device_id = ""
     _trae_machine_id = ""
+    _trae_client_id = ""      # 可选：替换默认 ClientID（不同客户端版本签发的 token 可能不同）
 
     def init_plugin(self, config: dict = None):
         """初始化插件配置"""
@@ -77,17 +81,19 @@ class WorkBuddyCheckin(_PluginBase):
         self._notify_mode = notify_mode if notify_mode in ("always", "fail", "off") else "always"
         # Trae 配置
         self._trae_enabled = config.get("trae_enabled", False)
+        self._trae_access_token = (config.get("trae_access_token") or "").strip()
         self._trae_refresh_token = (config.get("trae_refresh_token") or "").strip()
         self._trae_uid = (config.get("trae_uid") or "").strip()
         self._trae_host = (config.get("trae_host") or "https://api.trae.cn").strip().rstrip("/")
         self._trae_device_id = (config.get("trae_device_id") or "").strip()
         self._trae_machine_id = (config.get("trae_machine_id") or "").strip()
+        self._trae_client_id = (config.get("trae_client_id") or "").strip()
         self._session = requests.Session()
 
         if self._enabled and not self._refresh_token:
             logger.warn("WorkBuddyCheckin: 已启用但未配置 refreshToken，请先配置")
-        if self._trae_enabled and not self._trae_refresh_token:
-            logger.warn("WorkBuddyCheckin: Trae 已启用但未配置 refreshToken，请先配置")
+        if self._trae_enabled and (not self._trae_access_token and not self._trae_refresh_token):
+            logger.warn("WorkBuddyCheckin: Trae 已启用但 accessToken 和 refreshToken 都未配置，请先配置")
 
         # Trae 设备指纹需长期稳定，首次使用时生成并写入配置
         if self._trae_enabled and (not self._trae_device_id or not self._trae_machine_id):
@@ -193,8 +199,8 @@ class WorkBuddyCheckin(_PluginBase):
 
     def api_trae_checkin(self):
         """API: 手动触发 Trae 签到"""
-        if not self._trae_refresh_token:
-            return {"success": False, "message": "未配置 Trae refreshToken，请先在插件配置中填写"}
+        if not self._trae_access_token and not self._trae_refresh_token:
+            return {"success": False, "message": "未配置 Trae accessToken 或 refreshToken，请先在插件配置中填写"}
         result = self._trae_do_checkin()
         self._notify_result(result)
         return {
@@ -205,10 +211,10 @@ class WorkBuddyCheckin(_PluginBase):
 
     def api_trae_status(self):
         """API: 查询 Trae 签到状态"""
-        if not self._trae_refresh_token:
-            return {"success": False, "message": "未配置 Trae refreshToken"}
+        if not self._trae_access_token and not self._trae_refresh_token:
+            return {"success": False, "message": "未配置 Trae accessToken 或 refreshToken"}
         try:
-            token = self._trae_exchange_token()
+            token = self._trae_get_access_token()
             return {"success": True, "data": self._trae_get_status(token)}
         except Exception as e:
             return {"success": False, "message": str(e)}
@@ -216,7 +222,7 @@ class WorkBuddyCheckin(_PluginBase):
     def get_service(self) -> List[dict]:
         """注册定时服务（设定-服务 中可查看运行状态并手动启动）"""
         has_wb = self._enabled and self._refresh_token
-        has_trae = self._trae_enabled and self._trae_refresh_token
+        has_trae = self._trae_enabled and (self._trae_access_token or self._trae_refresh_token)
         if not has_wb and not has_trae:
             return []
         try:
@@ -422,11 +428,12 @@ class WorkBuddyCheckin(_PluginBase):
             raise TokenInvalidError("未配置 Trae refreshToken")
         if not self._trae_uid:
             raise TokenInvalidError("未配置 Trae User ID（x-uid）")
+        client_id = self._trae_client_id or TRAE_CLIENT_ID
         resp = self._session.post(
             f"{self._trae_host}/cloudide/api/v3/trae/oauth/ExchangeToken",
             headers={"Content-Type": "application/json", "Accept": "application/json"},
             json={
-                "ClientID": TRAE_CLIENT_ID,
+                "ClientID": client_id,
                 "RefreshToken": self._trae_refresh_token,
                 "ClientSecret": "-",
                 "UserID": self._trae_uid,
@@ -449,8 +456,24 @@ class WorkBuddyCheckin(_PluginBase):
             logger.info("WorkBuddyCheckin: Trae refreshToken 已自动轮换更新")
         if token:
             return token
-        detail = data.get("Message") or data.get("Error") or data.get("message") or ""
+        # 区分错误类型：ClientID 不匹配时提示用户填正确的 ClientID
+        body = json.dumps(data, ensure_ascii=False) if data else resp.text
+        if "not matched" in body.lower() or "refresh token is not matched" in body:
+            raise TokenInvalidError(
+                f"HTTP {resp.status_code} 服务端提示 refreshToken 与 ClientID 不匹配。\n"
+                f"当前使用的 ClientID={client_id}，请在 Trae 客户端抓包确认实际 ClientID 后填入配置。\n"
+                f"（或直接在「Access Token」处粘贴从登录态解密出来的 accessToken，绕过换 token 步骤）"
+            )
+        if resp.status_code in (401, 403):
+            raise TokenInvalidError(f"HTTP {resp.status_code} {body[:200]}")
+        detail = data.get("Message") or data.get("Error") or data.get("message") or body
         raise TokenInvalidError(f"HTTP {resp.status_code} {detail}".strip())
+
+    def _trae_get_access_token(self) -> str:
+        """优先使用用户手动配置的 accessToken，否则用 refreshToken 自动换新"""
+        if self._trae_access_token:
+            return self._trae_access_token
+        return self._trae_exchange_token()
 
     def _trae_get_status(self, access_token: str) -> dict:
         """查询 Trae 今日签到状态"""
@@ -467,29 +490,40 @@ class WorkBuddyCheckin(_PluginBase):
         return data
 
     def _trae_claim(self, access_token: str) -> dict:
-        """调用 Trae 领取签到积分接口"""
-        resp = self._session.post(
-            f"{self._trae_host}/trae/api/v2/ug/checkin_credits/claim",
-            headers=self._trae_headers(access_token), json={}, timeout=30
-        )
-        try:
-            data = resp.json()
-        except ValueError:
-            data = {}
-        if resp.status_code in (401, 403):
-            raise TokenInvalidError(f"HTTP {resp.status_code} {data.get('message', '')}".strip())
-        return data
+        """调用 Trae 领取签到积分接口，对 9074 限流做指数退避重试"""
+        data = {}
+        for attempt in range(3):
+            resp = self._session.post(
+                f"{self._trae_host}/trae/api/v2/ug/checkin_credits/claim",
+                headers=self._trae_headers(access_token), json={}, timeout=30
+            )
+            try:
+                data = resp.json()
+            except ValueError:
+                data = {}
+            if resp.status_code in (401, 403):
+                raise TokenInvalidError(f"HTTP {resp.status_code} {data.get('message', '')}".strip())
+            # 9074 = 参与用户太多，指数退避重试
+            if data.get("code") == 9074:
+                wait = 2 ** attempt
+                logger.warn(f"WorkBuddyCheckin: Trae 签到限流 9074，{wait}s 后第 {attempt+2} 次重试")
+                time.sleep(wait)
+                continue
+            return data
+        return data  # 重试 3 次后仍然限流，返回最后一次结果
 
     def _trae_do_checkin(self) -> dict:
-        """执行 Trae 签到全流程：换 token → 查状态 → 未签则领取"""
-        if not self._trae_refresh_token:
-            return self._finish("no_token", "Trae签到失败", "未配置 Trae refreshToken", prefix="trae")
+        """执行 Trae 签到全流程：取 token（优先 accessToken）→ 查状态 → 未签则领取"""
         if not self._trae_uid:
             return self._finish("no_token", "Trae签到失败",
                                 "未配置 Trae User ID（x-uid），请从客户端登录态中获取 userId 后填入",
                                 prefix="trae")
+        if not self._trae_access_token and not self._trae_refresh_token:
+            return self._finish(
+                "no_token", "Trae签到失败",
+                "未配置 Trae accessToken 或 refreshToken，至少填其一", prefix="trae")
         try:
-            token = self._trae_exchange_token()
+            token = self._trae_get_access_token()
             status = self._trae_get_status(token)
             code = status.get("code", -1)
             if code != 0:
@@ -528,13 +562,13 @@ class WorkBuddyCheckin(_PluginBase):
 
         except TokenInvalidError as e:
             return self._finish(
-                "token_invalid", "Trae签到失败：refreshToken已失效",
-                " Trae refreshToken 已被服务端拒绝，无法自动续期。\n"
-                "请重新从 Trae 客户端提取登录态并更新插件配置！\n"
-                "常见原因：\n"
-                "1. 客户端退出登录/切换账号，旧的 refreshToken 随之失效\n"
-                "2. 长时间未使用，refreshToken 超过有效期\n"
-                f"接口返回：{e.detail or '未知'}", prefix="trae")
+                "token_invalid", "Trae签到失败：令牌获取失败",
+                f"{e.detail or '未知错误'}\n\n"
+                "常见解决办法：\n"
+                "1. 优先使用 Access Token（从客户端登录态直接提取，绕过换 token 步骤）\n"
+                "2. 若必须用 RefreshToken，请确认 ClientID 与签发 refreshToken 的客户端版本匹配\n"
+                "3. 确保同一账号只在一个地方执行签到，避免多个脚本互相轮换刷新令牌",
+                prefix="trae")
         except requests.exceptions.ConnectionError:
             return self._finish(
                 "error", "Trae签到失败",
@@ -648,7 +682,8 @@ class WorkBuddyCheckin(_PluginBase):
                             "variant": "tonal",
                             "density": "compact",
                             "class": "mt-2 mb-1",
-                            "text": "Trae 签到（api.trae.cn）：需填写 refreshToken 与 User ID，"
+                            "text": "Trae 签到（api.trae.cn）：建议直接填 Access Token，"
+                                    "绕过 refreshToken 换 token 步骤（不同客户端版本的 ClientID 可能不同）；"
                                     "与 WorkBuddy 共用上面的签到时间与通知策略"
                         }
                     },
@@ -662,11 +697,23 @@ class WorkBuddyCheckin(_PluginBase):
                     {
                         "component": "VTextarea",
                         "props": {
+                            "model": "trae_access_token",
+                            "label": "Trae Access Token（推荐）",
+                            "placeholder": "粘贴 Trae 登录态中的 token（eyJ 开头的 JWT）",
+                            "rows": 2,
+                            "hint": "直接调用签到接口，最稳定；从客户端 storage.json 解密出来的登录态 JSON 里的 token 字段。"
+                                    "有效期约 15-30 天，过期后需重新提取"
+                        }
+                    },
+                    {
+                        "component": "VTextarea",
+                        "props": {
                             "model": "trae_refresh_token",
-                            "label": "Trae RefreshToken",
+                            "label": "Trae RefreshToken（备选）",
                             "placeholder": "粘贴 Trae 登录态中的 refreshToken",
-                            "rows": 3,
-                            "hint": "从 Trae/TraeWork 客户端 storage.json 提取；若被服务端拒绝需重新提取"
+                            "rows": 2,
+                            "hint": "留空则只使用 Access Token；某些客户端版本的 refreshToken 与默认 ClientID 不匹配，"
+                                    "报 400 时可尝试填 ClientID 或直接只用 Access Token"
                         }
                     },
                     {
@@ -675,7 +722,17 @@ class WorkBuddyCheckin(_PluginBase):
                             "model": "trae_uid",
                             "label": "Trae User ID",
                             "placeholder": "登录态中的 userId",
-                            "hint": "换取 accessToken 与 x-uid 请求头都依赖该值，必填"
+                            "hint": "x-uid 请求头必填（Access Token 换 token 时也要用到）"
+                        }
+                    },
+                    {
+                        "component": "VTextField",
+                        "props": {
+                            "model": "trae_client_id",
+                            "label": "Trae ClientID（可选）",
+                            "placeholder": "留空用默认 ono9krqynydwx5",
+                            "hint": "用于 refreshToken 换 accessToken，不同客户端版本可能不同；"
+                                    "报 400 refresh token 与 ClientID 不匹配时，从 Trae 客户端抓包确认后填入"
                         }
                     },
                     {
@@ -714,9 +771,11 @@ class WorkBuddyCheckin(_PluginBase):
             "cron": "0 8 * * *",
             "notify_mode": "always",
             "trae_enabled": False,
+            "trae_access_token": "",
             "trae_refresh_token": "",
             "trae_uid": "",
             "trae_host": "https://api.trae.cn",
+            "trae_client_id": "",
             "trae_device_id": "",
             "trae_machine_id": "",
         }
@@ -781,9 +840,9 @@ class WorkBuddyCheckin(_PluginBase):
         trae_last_result = config.get("last_trae_result", "")
         trae_status = {}
         trae_error = ""
-        if self._trae_refresh_token and self._trae_uid:
+        if (self._trae_access_token or self._trae_refresh_token) and self._trae_uid:
             try:
-                trae_status = self._trae_get_status(self._trae_exchange_token())
+                trae_status = self._trae_get_status(self._trae_get_access_token())
             except Exception as e:
                 trae_error = str(e)
 
@@ -804,11 +863,11 @@ class WorkBuddyCheckin(_PluginBase):
                 "props": {"class": "px-4 py-1 text-error text-body-2"},
                 "text": f"状态查询失败（不影响手动签到）：{trae_error}",
             })
-        elif not self._trae_refresh_token:
+        elif not self._trae_access_token and not self._trae_refresh_token:
             trae_rows.append({
                 "component": "div",
                 "props": {"class": "px-4 py-1 text-medium-emphasis"},
-                "text": "尚未配置 Trae refreshToken，请先在插件配置中填写",
+                "text": "尚未配置 Trae accessToken 或 refreshToken，请先在插件配置中填写",
             })
         elif not self._trae_uid:
             trae_rows.append({
