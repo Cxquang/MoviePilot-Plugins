@@ -3,7 +3,7 @@
 
 移植自 eooce/Auto-Renew-Bothosting（GitHub Actions + SeleniumBase 方案），
 改为 MoviePilot 内运行的浏览器自动化实现：
-1. 登录优先账号密码（密码不过期），未配置密码时用 session_token，失效可走 Discord OAuth 换新
+1. 登录优先 session_token（免登录页 Turnstile），失效/缺失时账号密码登录兜底（处理登录页 Turnstile），无密码时可走 Discord OAuth 换新
 2. 每天定时检查账单页，距到期不足 24 小时才执行续期
 3. 用 Playwright 启动 Chromium 模拟真人点击续期，在弹窗中处理 Cloudflare Turnstile
 4. 浏览器失败时触发 GitHub Actions（workflow_dispatch）兜底，轮询结果后推送
@@ -15,6 +15,8 @@ import os
 import re
 import sys
 import time
+import random
+import shutil
 import threading
 import traceback
 import subprocess
@@ -49,6 +51,23 @@ TURNSTILE_API = "https://challenges.cloudflare.com/turnstile/v0/api.js"
 BROWSERS_PATH = "/config/.playwright"   # 持久化到 config 卷，重建容器不用重复下载
 TURNSTILE_WAIT = 120                    # 等待 Turnstile token 上限（秒）
 BROWSER_TOTAL_TIMEOUT = 330             # 整个浏览器流程上限（秒）
+XVFB_DISPLAY = ":99"                    # 容器内有头模式使用的虚拟显示
+
+# 反自动化检测脚本：Cloudflare Turnstile 会检查 webdriver/headless 指纹
+STEALTH_JS = (
+    "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+    "Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});"
+    "Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});"
+    "Object.defineProperty(navigator, 'hardwareConcurrency', {get: () => 8});"
+    "Object.defineProperty(navigator, 'deviceMemory', {get: () => 8});"
+    "window.chrome = { runtime: {}, loadTimes: () => {}, csi: () => {}, app: {} };"
+    "Object.defineProperty(window, 'outerWidth', {get: () => 1366});"
+    "Object.defineProperty(window, 'outerHeight', {get: () => 768});"
+    "const origQuery = window.navigator.permissions.query;"
+    "window.navigator.permissions.query = (parameters) => ("
+    "parameters.name === 'notifications' ?"
+    "Promise.resolve({state: Notification.permission}) : origQuery(parameters));"
+)
 
 # GitHub Actions 备用方案
 GITHUB_API = "https://api.github.com"
@@ -66,11 +85,11 @@ class BotHostingRenew(_PluginBase):
     # 插件名称
     plugin_name = "Bot-Hosting自动续期"
     # 插件描述
-    plugin_desc = "Bot-Hosting.net 免费套餐自动续期（4天一期）：账号密码优先，浏览器模拟点击过 Turnstile，失败转 GitHub Actions 兜底并推送通知"
+    plugin_desc = "Bot-Hosting.net 免费套餐自动续期（4天一期）：token 优先、账号密码兜底登录，有头浏览器模拟点击过 Turnstile，失败转 GitHub Actions 兜底并推送通知"
     # 插件图标
     plugin_icon = "https://bot-hosting.net/favicon.ico"
     # 插件版本
-    plugin_version = "1.3.0"
+    plugin_version = "1.3.1"
     # 插件作者
     plugin_author = "Cxquang"
     # 作者主页
@@ -100,6 +119,8 @@ class BotHostingRenew(_PluginBase):
     _onlyonce = False
     # 运行状态
     _last_result = None
+    _xvfb_active = False
+    _gh_dispatch_ts = 0.0
 
     def init_plugin(self, config: dict = None):
         if config:
@@ -243,10 +264,13 @@ class BotHostingRenew(_PluginBase):
     def __do_renew_flow(self) -> dict:
         """完整续期流程，返回结果 dict"""
         session_token = self._session_token
-        login_method = "Session Token"
         use_password = bool(self._email and self._password)
-        if use_password:
+        if use_password and session_token:
+            login_method = "Session Token → 账号密码"
+        elif use_password:
             login_method = "账号密码"
+        else:
+            login_method = "Session Token"
 
         # 1. 查询账单页状态（没有 session_token 时跳过，直接走浏览器登录）
         if session_token:
@@ -394,10 +418,19 @@ class BotHostingRenew(_PluginBase):
             logger.info("浏览器续期失败，尝试触发 GitHub Actions 备用方案")
             ok, run_id, gh_err = self.__dispatch_github_action()
             if ok:
+                # 第一条通知：浏览器失败 -> 已转 Action 兜底（后台线程继续等结果）
+                self._notify_message(
+                    "浏览器续期失败，已转 GitHub Actions",
+                    f"失败原因：{err}\n"
+                    f"已触发 {self._gh_repo} 的 {self._gh_workflow}（ref: {self._gh_ref}）\n"
+                    "接下来每隔约 60 秒轮询一次执行状态（最长 30 分钟），"
+                    "Action 执行结束后会再发一条结果通知，并自动核对续期是否到账。",
+                    failure=True, expiry=expiry)
                 threading.Thread(target=self.__watch_github_run,
                                  args=(run_id, old_expiry), daemon=True).start()
                 return {
                     "success": True,
+                    "silent": True,  # 第一条通知已单独发出，避免重复推送
                     "title": "已转 GitHub Actions 续期",
                     "detail": f"浏览器续期失败：{err}\n"
                               f"已触发 {self._gh_repo} 的 {self._gh_workflow}，"
@@ -513,37 +546,14 @@ class BotHostingRenew(_PluginBase):
             logger.info(f"[BotHosting] {msg}")
             logs.append(msg)
 
-        launch_kwargs: Dict[str, Any] = {
-            "headless": True,
-            "args": [
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-blink-features=AutomationControlled",
-                "--disable-gpu",
-                "--no-first-run",
-                "--no-default-browser-check",
-                "--lang=en-US",
-            ],
-        }
         if self._proxy:
-            launch_kwargs["proxy"] = {"server": self._proxy}
             log(f"使用代理: {self.__mask_proxy(self._proxy)}")
 
         browser = None
+        xvfb_proc = None
         try:
             with sync_playwright() as p:
-                log("启动 Chromium...")
-                try:
-                    browser = p.chromium.launch(**launch_kwargs)
-                except Exception as e:
-                    msg = str(e)
-                    if "Executable doesn't exist" in msg or "playwright install" in msg:
-                        log("Chromium 未安装，开始下载（首次约 150MB，存放在 "
-                            f"{os.environ.get('PLAYWRIGHT_BROWSERS_PATH')}）...")
-                        self.__install_chromium()
-                        browser = p.chromium.launch(**launch_kwargs)
-                    else:
-                        raise
+                browser, xvfb_proc = self.__launch_chromium(p, self._proxy, log)
 
                 context = browser.new_context(
                     user_agent=USER_AGENT,
@@ -551,56 +561,53 @@ class BotHostingRenew(_PluginBase):
                     viewport={"width": 1366, "height": 900},
                     ignore_https_errors=True,
                 )
-                # 去掉自动化特征（Cloudflare 会检测 webdriver/plugins 等）
-                context.add_init_script(
-                    "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
-                    "Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});"
-                    "Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});"
-                    "window.chrome = { runtime: {} };"
-                )
+                # 去掉自动化特征（Cloudflare 会检测 webdriver/headless 指纹）
+                context.add_init_script(STEALTH_JS)
                 page = context.new_page()
                 page.set_default_timeout(30000)
                 log(f"Turnstile 资源连通性: {self.__check_turnstile_net()}")
 
-                logged_in = False
-                if self._email and self._password:
-                    # 优先级 1：账号密码登录（密码不会过期，比 session_token 稳）
-                    try:
-                        logged_in = self.__login_with_password(page, log)
-                    except Exception as e:
-                        log(f"账号密码登录异常: {e}")
-                if logged_in:
-                    # 同步登录后最新的 session_token，供后续查询与核对使用
-                    try:
-                        for c in context.cookies():
-                            value = c.get("value")
-                            if c.get("name") == "session_token" and value \
-                                    and value != self._session_token:
-                                self._session_token = value
-                                self.__save_config()
-                                log("已同步新的 session_token")
-                                break
-                    except Exception:
-                        pass
-                else:
-                    if not session_token:
-                        return {"ok": False,
-                                "error": "登录失败：账号密码登录未成功，且未配置可用的 session_token",
-                                "logs": logs[-10:]}
-                    log("回退到 session_token Cookie 注入")
+                # 登录策略：session_token 优先（免登录页 Turnstile），被重定向到
+                # /login 或没有 token 时才走账号密码登录（登录页也带 Turnstile）
+                if session_token:
+                    log("注入 session_token Cookie...")
                     context.add_cookies([
                         {"name": "session_token", "value": session_token, "url": f"{BASE_URL}/"},
                         {"name": "login", "value": "true", "url": f"{BASE_URL}/"},
                         {"name": "theme", "value": "system", "url": f"{BASE_URL}/"},
                     ])
-
-                log(f"打开账单页: {BILLINGS_URL}")
-                page.goto(BILLINGS_URL, wait_until="domcontentloaded", timeout=60000)
-                page.wait_for_timeout(1500)
-                log(f"当前地址: {page.url}")
-                if "/login" in page.url:
-                    return {"ok": False, "need_relogin": True,
-                            "error": "session_token 已失效（被重定向到登录页）"}
+                if not self.__goto_billings(page, log):
+                    if self._email and self._password:
+                        log("token 失效或缺失，改用账号密码登录...")
+                        ok_login = False
+                        try:
+                            ok_login = self.__login_with_password(page, log)
+                        except Exception as e:
+                            log(f"账号密码登录异常: {e}")
+                        if ok_login:
+                            # 同步登录后最新的 session_token，供后续查询与核对使用
+                            try:
+                                for c in context.cookies():
+                                    value = c.get("value")
+                                    if c.get("name") == "session_token" and value \
+                                            and value != self._session_token:
+                                        self._session_token = value
+                                        self.__save_config()
+                                        log("已同步新的 session_token")
+                                        break
+                            except Exception:
+                                pass
+                            if not self.__goto_billings(page, log):
+                                return {"ok": False, "need_relogin": True,
+                                        "error": "账号密码登录后仍无法进入账单页"}
+                        else:
+                            return {"ok": False, "need_relogin": True,
+                                    "error": "账号密码登录失败（登录页 Turnstile 未通过或账号密码错误）",
+                                    "logs": logs[-10:]}
+                    else:
+                        return {"ok": False, "need_relogin": True,
+                                "error": "session_token 已失效，且未配置账号密码，无法登录",
+                                "logs": logs[-10:]}
 
                 renew_btn = self.__find_renew_button(page)
                 if renew_btn is None:
@@ -671,42 +678,139 @@ class BotHostingRenew(_PluginBase):
             logger.error(f"[BotHosting] 浏览器流程失败: {e}\n{traceback.format_exc()}")
             return {"ok": False, "error": f"浏览器流程失败: {e}", "logs": logs[-10:]}
         finally:
+            self._xvfb_active = False
             if browser:
                 try:
                     browser.close()
                 except Exception:
                     pass
+            if xvfb_proc:
+                try:
+                    xvfb_proc.kill()
+                except Exception:
+                    pass
+
+    # ---------------------- 浏览器启动 / 登录辅助 ----------------------
+
+    def __launch_chromium(self, p, proxy: str, log) -> tuple:
+        """启动 Chromium：优先有头模式（Xvfb 虚拟显示，过 Cloudflare 更稳），
+        无 Xvfb 或启动失败时回退无头。返回 (browser, xvfb_proc)"""
+        args = [
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-blink-features=AutomationControlled",
+            "--disable-gpu",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--lang=en-US",
+        ]
+        launch_kwargs: Dict[str, Any] = {"args": args}
+        if proxy:
+            launch_kwargs["proxy"] = {"server": proxy}
+
+        xvfb_proc = None
+        if shutil.which("Xvfb"):
+            # 有头模式：启动虚拟显示，浏览器窗口渲染在 Xvfb 里，
+            # 指纹更接近真实用户，Cloudflare 更愿意出 token
+            try:
+                xvfb_proc = subprocess.Popen(
+                    ["Xvfb", XVFB_DISPLAY, "-screen", "0", "1366x900x24",
+                     "-nolisten", "tcp"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                )
+                time.sleep(1)
+                launch_kwargs["env"] = {**os.environ, "DISPLAY": XVFB_DISPLAY}
+                launch_kwargs["headless"] = False
+                browser = self.__launch_retry(p, launch_kwargs, log)
+                self._xvfb_active = True
+                log(f"有头模式启动成功（Xvfb {XVFB_DISPLAY}）")
+                return browser, xvfb_proc
+            except Exception as e:
+                log(f"有头模式启动失败，回退无头: {e}")
+                if xvfb_proc:
+                    try:
+                        xvfb_proc.kill()
+                    except Exception:
+                        pass
+                xvfb_proc = None
+
+        self._xvfb_active = False
+        launch_kwargs["headless"] = True
+        browser = self.__launch_retry(p, launch_kwargs, log)
+        log("无头模式启动成功（Cloudflare 可能拒发 token，请尽量保证有头模式）")
+        return browser, None
+
+    def __launch_retry(self, p, launch_kwargs: dict, log):
+        """启动 Chromium，未安装时自动下载二进制"""
+        try:
+            return p.chromium.launch(**launch_kwargs)
+        except Exception as e:
+            msg = str(e)
+            if "Executable doesn't exist" in msg or "playwright install" in msg:
+                log("Chromium 未安装，开始下载（首次约 150MB，存放在 "
+                    f"{os.environ.get('PLAYWRIGHT_BROWSERS_PATH')}）...")
+                self.__install_chromium()
+                return p.chromium.launch(**launch_kwargs)
+            raise
+
+    def __goto_billings(self, page, log) -> bool:
+        """打开账单页并确认登录态；连接被重置时重试一次"""
+        for attempt in (1, 2):
+            try:
+                log(f"打开账单页: {BILLINGS_URL}（第 {attempt} 次）")
+                page.goto(BILLINGS_URL, wait_until="domcontentloaded", timeout=60000)
+                page.wait_for_timeout(1500)
+                log(f"当前地址: {page.url}")
+            except Exception as e:
+                log(f"打开账单页失败: {e}")
+                if attempt == 1:
+                    page.wait_for_timeout(4000)
+                    continue
+                return False
+            if "/login" not in page.url:
+                return True
+            if attempt == 1:
+                log("被重定向到登录页，稍候重试一次...")
+                page.wait_for_timeout(3000)
+        return False
 
     # ---------------------- 登录 / 结果校验 ----------------------
 
     def __login_with_password(self, page, log) -> bool:
-        """账号密码登录（登录页带 Turnstile，验证通过后提交）"""
+        """账号密码登录（对齐 eooce 流程：Continue -> 填邮箱密码 -> Turnstile -> 提交）"""
         log("使用账号密码登录...")
-        page.goto(f"{BASE_URL}/login", wait_until="domcontentloaded", timeout=60000)
-        page.wait_for_timeout(2000)
+        try:
+            page.goto(f"{BASE_URL}/login", wait_until="domcontentloaded", timeout=60000)
+        except Exception as e:
+            log(f"登录页打开失败: {e}")
+            return False
+        page.wait_for_timeout(3000)
+        # 点击 Continue with email
         try:
             page.locator('button[type="submit"]').first.click(timeout=10000)
-            page.wait_for_timeout(3000)
         except Exception as e:
             log(f"未找到 Continue 按钮（可能已在邮箱表单）: {e}")
+        # 等邮箱表单出现（最多 25 秒）
         try:
-            page.wait_for_selector('input[type="email"]', timeout=20000)
+            page.wait_for_selector('input[type="email"]', timeout=25000)
         except Exception:
             log("登录页未出现邮箱输入框")
             return False
+        log("填写邮箱/密码...")
         page.fill('input[type="email"]', self._email)
-        page.wait_for_timeout(500)
-        page.fill('input[type="password"]', self._password)
         page.wait_for_timeout(1000)
+        page.fill('input[type="password"]', self._password)
+        page.wait_for_timeout(4000)  # eooce 在填完密码后等待 3 秒再处理 Turnstile
         token = self.__wait_turnstile(page, log)
         if not token:
             log("登录页 Turnstile 未通过，仍尝试提交")
         page.locator('button[type="submit"]').first.click()
-        page.wait_for_timeout(4000)
-        if "/login" in page.url:
-            log(f"登录后仍停留在登录页: {page.url}")
+        page.wait_for_timeout(8000)
+        cur = page.url or ""
+        if "/login" in cur:
+            log(f"登录后仍停留在登录页: {cur}")
             return False
-        log(f"账号密码登录成功，当前地址: {page.url}")
+        log(f"账号密码登录成功，当前地址: {cur}")
         return True
 
     def __verify_renewal(self, old_expiry: Optional[str]) -> Tuple[bool, str, Optional[str]]:
@@ -802,15 +906,21 @@ class BotHostingRenew(_PluginBase):
 
     def __gh_api(self, method: str, path: str, payload: Optional[dict] = None) -> dict:
         """调用 GitHub REST API（直连 api.github.com，gh-proxy 不支持可靠的 POST）"""
-        res = requests.request(
-            method, f"{GITHUB_API}{path}",
-            headers={
-                "Authorization": f"Bearer {self._gh_token}",
-                "Accept": "application/vnd.github+json",
-                "X-GitHub-Api-Version": "2022-11-28",
-            },
-            json=payload, proxies=self.__req_proxies(), timeout=30,
-        )
+        url = f"{GITHUB_API}{path}"
+        try:
+            res = requests.request(
+                method, url,
+                headers={
+                    "Authorization": f"Bearer {self._gh_token}",
+                    "Accept": "application/vnd.github+json",
+                    "X-GitHub-Api-Version": "2022-11-28",
+                },
+                json=payload, proxies=self.__req_proxies(), timeout=30,
+            )
+        except Exception as e:
+            logger.error(f"[BotHosting] GitHub API 请求失败 {method} {path}: {e}")
+            raise RuntimeError(f"无法连接 api.github.com：{e}") from e
+        logger.info(f"[BotHosting] GitHub API {method} {path} -> HTTP {res.status_code}")
         if res.status_code >= 400:
             raise RuntimeError(f"HTTP {res.status_code}: {res.text[:200]}")
         return res.json() if res.text else {}
@@ -819,27 +929,70 @@ class BotHostingRenew(_PluginBase):
         """触发 workflow_dispatch，返回 (成功, run_id, 错误)"""
         if not (self._gh_token and self._gh_repo and self._gh_workflow):
             return False, None, "未配置 GitHub Token / 仓库 / 工作流文件名"
-        try:
-            self.__gh_api("POST",
-                          f"/repos/{self._gh_repo}/actions/workflows/{self._gh_workflow}/dispatches",
-                          {"ref": self._gh_ref or "main"})
-        except Exception as e:
-            return False, None, f"{e}"
+
+        self._gh_dispatch_ts = time.time()
+        # dispatch 偶发网络抖动，重试 2 次
+        last_err = ""
+        for attempt in (1, 2):
+            try:
+                self.__gh_api(
+                    "POST",
+                    f"/repos/{self._gh_repo}/actions/workflows/{self._gh_workflow}/dispatches",
+                    {"ref": self._gh_ref or "main"})
+                last_err = ""
+                break
+            except Exception as e:
+                last_err = str(e)
+                logger.error(f"[BotHosting] 触发 workflow_dispatch 失败（第 {attempt} 次）: {e}")
+                if attempt == 1:
+                    time.sleep(5)
+        if last_err:
+            return False, None, self.__map_gh_error(last_err)
+
         logger.info(f"[BotHosting] 已触发 GitHub Actions: {self._gh_repo}/{self._gh_workflow}")
-        # dispatch 后 run 列表有几秒延迟，轮询拿到本次 run_id
-        for _ in range(6):
+        # dispatch 后 run 列表有几秒延迟，轮询拿到本次 run_id。
+        # 必须带 event=workflow_dispatch 过滤，否则会误拿旧定时 run
+        for _ in range(10):
             time.sleep(5)
             try:
                 data = self.__gh_api(
                     "GET",
-                    f"/repos/{self._gh_repo}/actions/workflows/{self._gh_workflow}/runs?per_page=5")
+                    f"/repos/{self._gh_repo}/actions/workflows/{self._gh_workflow}/runs"
+                    f"?per_page=5&event=workflow_dispatch")
             except Exception as e:
                 logger.warn(f"[BotHosting] 查询 Action run 失败: {e}")
                 continue
             runs = data.get("workflow_runs") or []
-            if runs:
-                return True, runs[0].get("id"), ""
+            for run in runs:
+                created = run.get("created_at") or ""
+                if created and self.__iso_after_dispatch(created):
+                    return True, run.get("id"), ""
+        # 拿不到 run_id 也不判失败：watcher 会继续按 event 过滤找最新 run
         return True, None, ""
+
+    @staticmethod
+    def __map_gh_error(err: str) -> str:
+        if "401" in err:
+            return (f"GitHub 鉴权失败（{err}）：Token 无效或已过期，请重新生成 PAT，"
+                    "细粒度需 Actions: Read and write")
+        if "403" in err:
+            return (f"GitHub 权限不足（{err}）：Token 缺 Actions 写权限，"
+                    "或未授权该仓库（细粒度 Token 需选 Cxquang/Auto-Renew-Bothosting）")
+        if "404" in err:
+            return (f"GitHub 找不到工作流（{err}）：请核对仓库名和工作流文件名"
+                    f"（当前 {self._gh_repo}/{self._gh_workflow}）")
+        if "无法连接" in err:
+            return (f"容器无法访问 api.github.com（{err}）：请检查代理配置，"
+                    "容器内执行 curl -I https://api.github.com 验证")
+        return f"GitHub API 调用失败：{err}"
+
+    def __iso_after_dispatch(self, iso: str) -> bool:
+        """run 的创建时间必须晚于本次 dispatch 时间（容差 60 秒）"""
+        try:
+            created = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+            return created.timestamp() >= self._gh_dispatch_ts - 60
+        except Exception:
+            return True
 
     def __watch_github_run(self, run_id: Optional[int], old_expiry: Optional[str]):
         """后台等待 Action 完成 -> 推送结论 -> 核对一次到期时间 -> 推送最终结果"""
@@ -853,9 +1006,12 @@ class BotHostingRenew(_PluginBase):
                 else:
                     data = self.__gh_api(
                         "GET",
-                        f"/repos/{self._gh_repo}/actions/workflows/{self._gh_workflow}/runs?per_page=5")
+                        f"/repos/{self._gh_repo}/actions/workflows/{self._gh_workflow}/runs"
+                        f"?per_page=5&event=workflow_dispatch")
                     runs = data.get("workflow_runs") or []
-                    run = runs[0] if runs else None
+                    run = next((r for r in runs
+                                if self.__iso_after_dispatch(r.get("created_at") or "")),
+                               None)
             except Exception as e:
                 logger.warn(f"[BotHosting] 轮询 Action 状态失败: {e}")
                 continue
@@ -940,7 +1096,7 @@ class BotHostingRenew(_PluginBase):
         return None
 
     def __wait_turnstile(self, page, log) -> str:
-        """轮询 cf-turnstile-response；为空时尝试点击复选框"""
+        """轮询 cf-turnstile-response；为空时按近似真人的节奏点击复选框"""
         # 先确认 Turnstile 组件本身是否加载出来
         try:
             page.locator(TURNSTILE_FRAME_SELECTOR).first.wait_for(state="attached", timeout=20000)
@@ -953,17 +1109,20 @@ class BotHostingRenew(_PluginBase):
             pass
 
         deadline = time.time() + TURNSTILE_WAIT
-        last_click = 0.0
         attempt = 0
+        next_click = time.time() + 6  # 先给组件几秒渲染时间
         while time.time() < deadline:
             token = self.__read_turnstile_token(page)
             if token:
                 return token
-            if attempt < 10 and time.time() - last_click >= 8:
+            if attempt < 10 and time.time() >= next_click:
                 attempt += 1
                 if self.__click_turnstile(page):
-                    log(f"第 {attempt} 次点击 Turnstile 复选框（token 仍为空）")
-                last_click = time.time()
+                    log(f"第 {attempt} 次点击 Turnstile（token 仍为空）")
+                else:
+                    log(f"第 {attempt} 次未定位到 Turnstile 可点击对象")
+                # eooce 的节奏：每 10~13 秒重试一次，带随机抖动更像真人
+                next_click = time.time() + random.uniform(8, 13)
             page.wait_for_timeout(1500)
         return ""
 
@@ -979,7 +1138,14 @@ class BotHostingRenew(_PluginBase):
 
     @staticmethod
     def __read_turnstile_token(page) -> str:
+        # eooce 同款：优先官方 JS 接口 getResponse()（显式渲染时 input 不一定及时写入）
         js = """() => {
+            try {
+                if (window.turnstile && window.turnstile.getResponse) {
+                    const t = window.turnstile.getResponse();
+                    if (t) return t;
+                }
+            } catch (e) {}
             const el = document.querySelector('input[name="cf-turnstile-response"]');
             return el ? (el.value || '') : '';
         }"""
@@ -1000,11 +1166,52 @@ class BotHostingRenew(_PluginBase):
                     continue
         return ""
 
-    @staticmethod
-    def __click_turnstile(page) -> bool:
-        """点击 Turnstile 复选框：优先点 iframe 内 checkbox，其次按坐标点"""
+    def __click_turnstile(self, page) -> bool:
+        """点击 Turnstile 复选框。
+
+        Cloudflare 会拒绝纯程序化点击（CDP 注入的鼠标事件特征明显），eooce
+        方案能过的关键是用 xdotool 发真实 X11 鼠标事件。有头模式下优先走
+        xdotool 底层点击，其次用带轨迹的 CDP 鼠标点击兜底。
+        """
+        # 1. 有头模式：xdotool 真实鼠标点击（和 eooce 的「底层点击」一致）
+        if self._xvfb_active and shutil.which("xdotool"):
+            try:
+                win = page.evaluate(
+                    "() => ({sx: window.screenX || 0, sy: window.screenY || 0,"
+                    " oh: window.outerHeight || 900, ih: window.innerHeight || 900})")
+                el = page.query_selector(TURNSTILE_FRAME_SELECTOR)
+                box = el.bounding_box() if el else None
+                if box and box.get("width"):
+                    bar = int(win.get("oh") or 900) - int(win.get("ih") or 900)
+                    ax = int(box["x"] + 30) + int(win.get("sx") or 0)
+                    ay = int(box["y"] + box["height"] * 0.5) + int(win.get("sy") or 0) + bar
+                    env = {**os.environ, "DISPLAY": XVFB_DISPLAY}
+                    # 先把 Chromium 窗口提为活动窗口（eooce 同款），
+                    # 否则 xdotool 的点击可能落在别的窗口上
+                    for _cls in ("chrom", "chrome", "google-chrome"):
+                        try:
+                            r = subprocess.run(
+                                ["xdotool", "search", "--onlyvisible", "--class", _cls],
+                                env=env, capture_output=True, text=True, timeout=5)
+                            wids = [w for w in (r.stdout or "").split() if w.strip()]
+                            if wids:
+                                subprocess.run(
+                                    ["xdotool", "windowactivate", "--sync", wids[0]],
+                                    env=env, capture_output=True, timeout=5)
+                                time.sleep(0.2)
+                                break
+                        except Exception:
+                            continue
+                    subprocess.run(["xdotool", "mousemove", "--sync", str(ax), str(ay)],
+                                   env=env, timeout=5, capture_output=True)
+                    subprocess.run(["xdotool", "click", "1"],
+                                   env=env, timeout=5, capture_output=True)
+                    return True
+            except Exception:
+                pass
+        # 2. iframe 内 checkbox 常规点击
         try:
-            frame = page.frame_locator('iframe[src*="challenges.cloudflare.com"]')
+            frame = page.frame_locator(TURNSTILE_FRAME_SELECTOR)
             for sel in ('input[type="checkbox"]', "#checkbox", 'label[for="checkbox"]'):
                 try:
                     loc = frame.locator(sel)
@@ -1026,18 +1233,21 @@ class BotHostingRenew(_PluginBase):
                         return True
                 except Exception:
                     continue
-            # 复选框常在 iframe 左上角，坐标点击兜底
-            try:
-                frame.click("body", position={"x": 30, "y": 32}, timeout=3000)
-                return True
-            except Exception:
-                continue
+        # 3. 带随机轨迹的坐标点击（比直接 click 更接近真人）
         try:
-            el = page.query_selector('iframe[src*="challenges.cloudflare.com"]')
+            el = page.query_selector(TURNSTILE_FRAME_SELECTOR)
             box = el.bounding_box() if el else None
             if box and box.get("width"):
-                page.mouse.click(box["x"] + box["width"] * 0.15,
-                                 box["y"] + box["height"] * 0.5)
+                for _ in range(3):
+                    page.mouse.move(box["x"] + random.uniform(0, box["width"]),
+                                    box["y"] + random.uniform(0, box["height"]),
+                                    steps=random.randint(8, 16))
+                    page.wait_for_timeout(random.randint(120, 350))
+                tx = box["x"] + box["width"] * 0.15
+                ty = box["y"] + box["height"] * 0.5
+                page.mouse.move(tx, ty, steps=random.randint(10, 20))
+                page.wait_for_timeout(random.randint(200, 500))
+                page.mouse.click(tx, ty)
                 return True
         except Exception:
             pass
@@ -1175,10 +1385,8 @@ class BotHostingRenew(_PluginBase):
     # ------------------------------------------------------------------
 
     def __notify_result(self, result: dict):
-        """按策略推送通知"""
-        if self._notify == NOTIFY_OFF:
-            return
-        if self._notify == NOTIFY_FAILURE and result.get("success"):
+        """按策略推送通知；silent 结果（已单独发过通知）直接跳过"""
+        if result.get("silent"):
             return
         self._notify_message(result.get("title") or "执行完成",
                              result.get("detail") or "",
@@ -1186,7 +1394,11 @@ class BotHostingRenew(_PluginBase):
                              expiry=result.get("expiry"))
 
     def _notify_message(self, title: str, text: str, failure: bool = False, expiry: str = ""):
-        """拼接通知文案并推送（MP 消息渠道，含企业微信）"""
+        """拼接通知文案并推送（MP 消息渠道，含企业微信），并按通知策略过滤"""
+        if self._notify == NOTIFY_OFF:
+            return
+        if self._notify == NOTIFY_FAILURE and not failure:
+            return
         lines = ["Bot-Hosting 自动续期通知", ""]
         lines.append(("❌ " if failure else "✅ ") + title)
         if self._email:
