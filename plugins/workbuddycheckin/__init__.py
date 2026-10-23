@@ -9,6 +9,7 @@ import hashlib
 import json
 import platform
 import secrets
+import threading
 import time
 import uuid
 from datetime import datetime
@@ -41,8 +42,8 @@ class WorkBuddyCheckin(_PluginBase):
 
     # 插件元数据
     plugin_name = "WorkBuddyCheckin"
-    plugin_desc = "WorkBuddy 与 Trae 每日自动签到：自动领取积分，支持手动一键签到、远程触发、消息通知策略。"
-    plugin_version = "1.3.4"
+    plugin_desc = "WorkBuddy 与 Trae 每日自动签到：自动领取积分，支持设置页保存后立即执行一次、定时签到、远程触发、消息通知策略。"
+    plugin_version = "1.4.0"
     plugin_author = "Cxquang"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/autosignin.png"
     plugin_order = 100
@@ -111,6 +112,23 @@ class WorkBuddyCheckin(_PluginBase):
                     self.update_config(config)
                 except Exception as e:
                     logger.warn(f"WorkBuddyCheckin: 保存 Trae 设备指纹失败: {e}")
+
+        # 「保存后立即执行一次」开关：在后台线程执行一轮签到，不阻塞配置保存请求
+        if config.get("run_once"):
+            config["run_once"] = False
+            try:
+                self.update_config(config)
+            except Exception as e:
+                logger.warn(f"WorkBuddyCheckin: 复位「执行一次」开关失败: {e}")
+            if self._enabled or self._trae_enabled:
+                logger.info("WorkBuddyCheckin: 收到「立即执行一次」指令，开始后台执行签到")
+                threading.Thread(
+                    target=self._run_all_once,
+                    name="WorkBuddyCheckin-RunOnce",
+                    daemon=True,
+                ).start()
+            else:
+                logger.warn("WorkBuddyCheckin: 已打开「执行一次」，但插件与 Trae 均未启用，跳过执行")
 
     def get_state(self) -> bool:
         return self._enabled or self._trae_enabled
@@ -237,14 +255,50 @@ class WorkBuddyCheckin(_PluginBase):
             logger.error(f"WorkBuddyCheckin: cron 表达式不正确({self._cron}): {e}")
             return []
 
-    def _scheduled_checkin(self):
-        """定时签到任务：按启用情况依次签到，合并为一条通知"""
+    def _collect_checkin_results(self) -> List[dict]:
+        """按启用情况依次执行签到，返回结果列表，并把每一步写入插件日志"""
         results = []
         if self._enabled and self._refresh_token:
-            results.append(self._do_checkin())
-        if self._trae_enabled and self._trae_refresh_token:
-            results.append(self._trae_do_checkin())
+            logger.info("WorkBuddyCheckin: 开始执行 WorkBuddy 签到")
+            result = self._do_checkin()
+            logger.info(
+                f"WorkBuddyCheckin: WorkBuddy 签到结果 -> {result.get('status')} | "
+                f"{(result.get('text') or '').splitlines()[0] if result.get('text') else ''}"
+            )
+            results.append(result)
+        elif self._enabled:
+            logger.warn("WorkBuddyCheckin: WorkBuddy 已启用但未配置 refreshToken，跳过")
+
+        if self._trae_enabled and (self._trae_access_token or self._trae_refresh_token):
+            logger.info("WorkBuddyCheckin: 开始执行 Trae 签到")
+            result = self._trae_do_checkin()
+            logger.info(
+                f"WorkBuddyCheckin: Trae 签到结果 -> {result.get('status')} | "
+                f"{(result.get('text') or '').splitlines()[0] if result.get('text') else ''}"
+            )
+            results.append(result)
+        elif self._trae_enabled:
+            logger.warn("WorkBuddyCheckin: Trae 已启用但未配置 accessToken/refreshToken，跳过")
+
+        return results
+
+    def _run_all_once(self):
+        """「保存后立即执行一次」：后台线程执行一轮完整签到"""
+        logger.info("WorkBuddyCheckin: ===== 手动执行一次签到开始 =====")
+        try:
+            results = self._collect_checkin_results()
+            logger.info(f"WorkBuddyCheckin: 手动执行完成，共 {len(results)} 个结果")
+            self._notify_results(results)
+        except Exception as e:
+            logger.error(f"WorkBuddyCheckin: 手动执行签到异常: {e}")
+        logger.info("WorkBuddyCheckin: ===== 手动执行一次签到结束 =====")
+
+    def _scheduled_checkin(self):
+        """定时签到任务：按启用情况依次签到，合并为一条通知"""
+        logger.info("WorkBuddyCheckin: 定时签到任务开始")
+        results = self._collect_checkin_results()
         self._notify_results(results)
+        logger.info("WorkBuddyCheckin: 定时签到任务结束")
 
     # ==================== 签到核心逻辑 ====================
 
@@ -253,6 +307,7 @@ class WorkBuddyCheckin(_PluginBase):
         if not self._refresh_token:
             return self._finish("no_token", "WorkBuddy签到失败", "未配置 refreshToken")
 
+        logger.info("WorkBuddyCheckin: WorkBuddy 签到流程开始（刷新令牌 → 签到 → 查询状态）")
         try:
             # 1. 刷新令牌（失效时抛 TokenInvalidError，走明确的重填提示）
             try:
@@ -283,6 +338,7 @@ class WorkBuddyCheckin(_PluginBase):
 
             uid = self._uid or ""
             domain = auth.get("domain", "www.workbuddy.cn")
+            logger.info("WorkBuddyCheckin: WorkBuddy 令牌刷新成功，开始调用签到接口")
 
             # 2. 签到
             checkin_result = self._claim_checkin(auth["accessToken"], uid, domain)
@@ -522,6 +578,10 @@ class WorkBuddyCheckin(_PluginBase):
             return self._finish(
                 "no_token", "Trae签到失败",
                 "未配置 Trae accessToken 或 refreshToken，至少填其一", prefix="trae")
+        logger.info(
+            "WorkBuddyCheckin: Trae 签到流程开始（令牌来源: %s）"
+            % ("AccessToken 直填" if self._trae_access_token else "RefreshToken 换取")
+        )
         try:
             token = self._trae_get_access_token()
             status = self._trae_get_status(token)
@@ -763,15 +823,29 @@ class WorkBuddyCheckin(_PluginBase):
                         }
                     },
                     {
+                        "component": "VDivider",
+                        "props": {"class": "my-3"},
+                    },
+                    {
                         "component": "VAlert",
                         "props": {
-                            "type": "warning",
+                            "type": "info",
                             "variant": "tonal",
                             "density": "compact",
-                            "class": "mt-2",
-                            "text": "MoviePilot 的设置表单不支持按钮点击事件，"
-                                    "手动签到/状态查询按钮已放在插件「详情页」（本插件详情页无实时网络请求，秒开）。"
-                                    "点击后到 MoviePilot「日志中心」查看执行日志。"
+                            "class": "mb-2",
+                            "text": "把「保存后立即执行一次签到」打开后保存配置，"
+                                    "插件会立刻在后台执行一轮 WorkBuddy + Trae 签到，执行完自动复位为关闭。"
+                                    "全部执行过程都会写入插件日志（插件卡片上的「日志」按钮）。"
+                        }
+                    },
+                    {
+                        "component": "VSwitch",
+                        "props": {
+                            "model": "run_once",
+                            "label": "保存后立即执行一次签到",
+                            "color": "primary",
+                            "hint": "打开并保存后立即在后台执行一次签到；执行结束自动复位为关闭，不影响定时任务",
+                            "persistent-hint": True,
                         }
                     },
                 ]
@@ -790,6 +864,7 @@ class WorkBuddyCheckin(_PluginBase):
             "trae_client_id": "",
             "trae_device_id": "",
             "trae_machine_id": "",
+            "run_once": False,
         }
 
     @staticmethod
@@ -842,57 +917,14 @@ class WorkBuddyCheckin(_PluginBase):
         if trae_last_result:
             trae_rows.append(self._stat_row("上次签到", f"{trae_last_result}（{trae_last_time}）"))
 
-        def btn(text: str, path: str, color: str = "primary", variant: str = "flat") -> dict:
-            """详情页操作按钮：走 MoviePilot 详情页内置事件机制调用插件 API"""
-            return {
-                "component": "VBtn",
-                "props": {
-                    "color": color,
-                    "variant": variant,
-                    "size": "small",
-                    "block": False,
-                    "class": "mr-1 mb-1",
-                },
-                "text": text,
-                "events": {
-                    "click": {
-                        "api": f"plugin/{self.__class__.__name__}/{path}",
-                        "method": "get",
-                    }
-                },
-            }
-
         return [
             {
                 "component": "VAlert",
                 "props": {
                     "type": "info", "variant": "tonal", "density": "compact",
-                    "text": "详情页无实时网络请求，秒开。手动签到/状态查询结果"
-                            "请在 MoviePilot「日志中心」查看。"
+                    "text": "本页仅展示缓存的签到结果。需要立即签到：到插件「设置」打开"
+                            "「保存后立即执行一次签到」并保存，执行日志在插件「日志」中查看。"
                 }
-            },
-            {
-                "component": "VCard",
-                "props": {"variant": "tonal"},
-                "content": [
-                    {
-                        "component": "div",
-                        "props": {"class": "px-4 pt-3 pb-1"},
-                        "content": [
-                            {"component": "span", "props": {"class": "text-h6"}, "text": "手动操作"},
-                        ],
-                    },
-                    {
-                        "component": "div",
-                        "props": {"class": "px-4 pb-3"},
-                        "content": [
-                            btn("WorkBuddy 立即签到", "checkin"),
-                            btn("WorkBuddy 查询状态", "status", "secondary", "tonal"),
-                            btn("Trae 立即签到", "trae_checkin"),
-                            btn("Trae 查询状态", "trae_status", "secondary", "tonal"),
-                        ],
-                    },
-                ]
             },
             {
                 "component": "VCard",
