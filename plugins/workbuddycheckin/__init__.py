@@ -42,7 +42,7 @@ class WorkBuddyCheckin(_PluginBase):
     # 插件元数据
     plugin_name = "WorkBuddyCheckin"
     plugin_desc = "WorkBuddy 与 Trae 每日自动签到：自动领取积分，支持手动一键签到、远程触发、消息通知策略。"
-    plugin_version = "1.3.2"
+    plugin_version = "1.3.3"
     plugin_author = "Cxquang"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/autosignin.png"
     plugin_order = 100
@@ -763,85 +763,16 @@ class WorkBuddyCheckin(_PluginBase):
                         }
                     },
                     {
-                        "component": "VDivider",
-                        "props": {"class": "my-3"},
-                    },
-                    {
-                        "component": "div",
-                        "props": {"class": "d-flex gap-2 flex-wrap"},
-                        "content": [
-                            {
-                                "component": "VBtn",
-                                "props": {
-                                    "color": "primary",
-                                    "variant": "flat",
-                                    "size": "small",
-                                    "prepend-icon": "mdi-cash-check",
-                                    "class": "mr-1",
-                                },
-                                "text": "WorkBuddy 立即签到",
-                                "events": {
-                                    "click": {
-                                        "api": f"plugin/{self.__class__.__name__}/checkin?apikey={settings.API_TOKEN}",
-                                        "method": "get",
-                                    }
-                                },
-                            },
-                            {
-                                "component": "VBtn",
-                                "props": {
-                                    "color": "secondary",
-                                    "variant": "tonal",
-                                    "size": "small",
-                                    "prepend-icon": "mdi-information-outline",
-                                },
-                                "text": "WorkBuddy 查询状态",
-                                "events": {
-                                    "click": {
-                                        "api": f"plugin/{self.__class__.__name__}/status?apikey={settings.API_TOKEN}",
-                                        "method": "get",
-                                    }
-                                },
-                            },
-                            {
-                                "component": "VBtn",
-                                "props": {
-                                    "color": "primary",
-                                    "variant": "flat",
-                                    "size": "small",
-                                    "prepend-icon": "mdi-cash-check",
-                                    "class": "mr-1",
-                                },
-                                "text": "Trae 立即签到",
-                                "events": {
-                                    "click": {
-                                        "api": f"plugin/{self.__class__.__name__}/trae_checkin?apikey={settings.API_TOKEN}",
-                                        "method": "get",
-                                    }
-                                },
-                            },
-                            {
-                                "component": "VBtn",
-                                "props": {
-                                    "color": "secondary",
-                                    "variant": "tonal",
-                                    "size": "small",
-                                    "prepend-icon": "mdi-information-outline",
-                                },
-                                "text": "Trae 查询状态",
-                                "events": {
-                                    "click": {
-                                        "api": f"plugin/{self.__class__.__name__}/trae_status?apikey={settings.API_TOKEN}",
-                                        "method": "get",
-                                    }
-                                },
-                            },
-                        ],
-                    },
-                    {
-                        "component": "div",
-                        "props": {"class": "text-body-2 text-medium-emphasis mt-1"},
-                        "text": "按钮点击后由 MoviePilot 插件后端执行，执行结果与完整请求链路请在 MoviePilot「日志中心」查看"
+                        "component": "VAlert",
+                        "props": {
+                            "type": "warning",
+                            "variant": "tonal",
+                            "density": "compact",
+                            "class": "mt-2",
+                            "text": "MoviePilot 的设置表单不支持按钮点击事件，"
+                                    "手动签到/状态查询按钮已放在插件「详情页」（本插件详情页无实时网络请求，秒开）。"
+                                    "点击后到 MoviePilot「日志中心」查看执行日志。"
+                        }
                     },
                 ]
             }
@@ -911,14 +842,57 @@ class WorkBuddyCheckin(_PluginBase):
         if trae_last_result:
             trae_rows.append(self._stat_row("上次签到", f"{trae_last_result}（{trae_last_time}）"))
 
+        def btn(text: str, path: str, color: str = "primary", variant: str = "flat") -> dict:
+            """详情页操作按钮：走 MoviePilot 详情页内置事件机制调用插件 API"""
+            return {
+                "component": "VBtn",
+                "props": {
+                    "color": color,
+                    "variant": variant,
+                    "size": "small",
+                    "block": False,
+                    "class": "mr-1 mb-1",
+                },
+                "text": text,
+                "events": {
+                    "click": {
+                        "api": f"plugin/{self.__class__.__name__}/{path}",
+                        "method": "get",
+                    }
+                },
+            }
+
         return [
             {
                 "component": "VAlert",
                 "props": {
                     "type": "info", "variant": "tonal", "density": "compact",
-                    "text": "手动签到与状态查询按钮已迁移到「插件设置」，"
-                            "本页面仅展示缓存结果避免因网络请求阻塞。"
+                    "text": "详情页无实时网络请求，秒开。手动签到/状态查询结果"
+                            "请在 MoviePilot「日志中心」查看。"
                 }
+            },
+            {
+                "component": "VCard",
+                "props": {"variant": "tonal"},
+                "content": [
+                    {
+                        "component": "div",
+                        "props": {"class": "px-4 pt-3 pb-1"},
+                        "content": [
+                            {"component": "span", "props": {"class": "text-h6"}, "text": "手动操作"},
+                        ],
+                    },
+                    {
+                        "component": "div",
+                        "props": {"class": "px-4 pb-3"},
+                        "content": [
+                            btn("WorkBuddy 立即签到", "checkin"),
+                            btn("WorkBuddy 查询状态", "status", "secondary", "tonal"),
+                            btn("Trae 立即签到", "trae_checkin"),
+                            btn("Trae 查询状态", "trae_status", "secondary", "tonal"),
+                        ],
+                    },
+                ]
             },
             {
                 "component": "VCard",
