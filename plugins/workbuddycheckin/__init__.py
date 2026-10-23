@@ -43,7 +43,7 @@ class WorkBuddyCheckin(_PluginBase):
     # 插件元数据
     plugin_name = "WorkBuddyCheckin"
     plugin_desc = "WorkBuddy 与 Trae 每日自动签到：自动领取积分，支持设置页保存后立即执行一次、定时签到、远程触发、消息通知策略。"
-    plugin_version = "1.4.1"
+    plugin_version = "1.5.0"
     plugin_author = "Cxquang"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/autosignin.png"
     plugin_order = 100
@@ -89,12 +89,14 @@ class WorkBuddyCheckin(_PluginBase):
         self._trae_device_id = (config.get("trae_device_id") or "").strip()
         self._trae_machine_id = (config.get("trae_machine_id") or "").strip()
         self._trae_client_id = (config.get("trae_client_id") or "").strip()
+        # Trae 独立签到时间：留空则与 WorkBuddy 共用主签到时间
+        self._trae_cron = (config.get("trae_cron") or "").strip() or self._cron
         self._session = requests.Session()
 
         if self._enabled and not self._refresh_token:
-            logger.warn("WorkBuddyCheckin: 已启用但未配置 refreshToken，请先配置")
+            logger.warning("WorkBuddyCheckin: 已启用但未配置 refreshToken，请先配置")
         if self._trae_enabled and (not self._trae_access_token and not self._trae_refresh_token):
-            logger.warn("WorkBuddyCheckin: Trae 已启用但 accessToken 和 refreshToken 都未配置，请先配置")
+            logger.warning("WorkBuddyCheckin: Trae 已启用但 accessToken 和 refreshToken 都未配置，请先配置")
 
         # Trae 设备指纹需长期稳定，首次使用时生成并写入配置
         if self._trae_enabled and (not self._trae_device_id or not self._trae_machine_id):
@@ -111,7 +113,7 @@ class WorkBuddyCheckin(_PluginBase):
                 try:
                     self.update_config(config)
                 except Exception as e:
-                    logger.warn(f"WorkBuddyCheckin: 保存 Trae 设备指纹失败: {e}")
+                    logger.warning(f"WorkBuddyCheckin: 保存 Trae 设备指纹失败: {e}")
 
         # 「保存后立即执行一次」开关：在后台线程执行一轮签到，不阻塞配置保存请求
         if config.get("run_once"):
@@ -119,7 +121,7 @@ class WorkBuddyCheckin(_PluginBase):
             try:
                 self.update_config(config)
             except Exception as e:
-                logger.warn(f"WorkBuddyCheckin: 复位「执行一次」开关失败: {e}")
+                logger.warning(f"WorkBuddyCheckin: 复位「执行一次」开关失败: {e}")
             if self._enabled or self._trae_enabled:
                 logger.info("WorkBuddyCheckin: 收到「立即执行一次」指令，开始后台执行签到")
                 threading.Thread(
@@ -128,7 +130,7 @@ class WorkBuddyCheckin(_PluginBase):
                     daemon=True,
                 ).start()
             else:
-                logger.warn("WorkBuddyCheckin: 已打开「执行一次」，但插件与 Trae 均未启用，跳过执行")
+                logger.warning("WorkBuddyCheckin: 已打开「执行一次」，但插件与 Trae 均未启用，跳过执行")
 
     def get_state(self) -> bool:
         return self._enabled or self._trae_enabled
@@ -238,22 +240,31 @@ class WorkBuddyCheckin(_PluginBase):
             return {"success": False, "message": str(e)}
 
     def get_service(self) -> List[dict]:
-        """注册定时服务（设定-服务 中可查看运行状态并手动启动）"""
-        has_wb = self._enabled and self._refresh_token
-        has_trae = self._trae_enabled and (self._trae_access_token or self._trae_refresh_token)
-        if not has_wb and not has_trae:
-            return []
-        try:
-            return [{
-                "id": "WorkBuddyCheckin",
-                "name": "WorkBuddy/Trae 每日签到",
-                "trigger": CronTrigger.from_crontab(self._cron),
-                "func": self._scheduled_checkin,
-                "kwargs": {}
-            }]
-        except Exception as e:
-            logger.error(f"WorkBuddyCheckin: cron 表达式不正确({self._cron}): {e}")
-            return []
+        """注册定时服务（WorkBuddy 与 Trae 可分别设置签到时间）"""
+        services = []
+        if self._enabled and self._refresh_token:
+            try:
+                services.append({
+                    "id": "WorkBuddyCheckin",
+                    "name": "WorkBuddy 每日签到",
+                    "trigger": CronTrigger.from_crontab(self._cron),
+                    "func": self._scheduled_wb_checkin,
+                    "kwargs": {}
+                })
+            except Exception as e:
+                logger.error(f"WorkBuddyCheckin: WorkBuddy cron 表达式不正确({self._cron}): {e}")
+        if self._trae_enabled and (self._trae_access_token or self._trae_refresh_token):
+            try:
+                services.append({
+                    "id": "WorkBuddyCheckinTrae",
+                    "name": "Trae 每日签到",
+                    "trigger": CronTrigger.from_crontab(self._trae_cron),
+                    "func": self._scheduled_trae_checkin,
+                    "kwargs": {}
+                })
+            except Exception as e:
+                logger.error(f"WorkBuddyCheckin: Trae cron 表达式不正确({self._trae_cron}): {e}")
+        return services
 
     def _run_with_timeout(self, label: str, func, timeout: int, prefix: str) -> dict:
         """独立线程执行单个签到任务：超时直接返回失败结果，避免整体流程与通知被卡死
@@ -297,25 +308,25 @@ class WorkBuddyCheckin(_PluginBase):
         results = []
         if self._enabled and self._refresh_token:
             logger.info("WorkBuddyCheckin: 开始执行 WorkBuddy 签到")
-            result = self._run_with_timeout("WorkBuddy", self._do_checkin, 120, "checkin")
+            result = self._run_with_timeout("WorkBuddy", self._do_checkin, 300, "checkin")
             logger.info(
                 f"WorkBuddyCheckin: WorkBuddy 签到结果 -> {result.get('status')} | "
                 f"{(result.get('text') or '').splitlines()[0] if result.get('text') else ''}"
             )
             results.append(result)
         elif self._enabled:
-            logger.warn("WorkBuddyCheckin: WorkBuddy 已启用但未配置 refreshToken，跳过")
+            logger.warning("WorkBuddyCheckin: WorkBuddy 已启用但未配置 refreshToken，跳过")
 
         if self._trae_enabled and (self._trae_access_token or self._trae_refresh_token):
             logger.info("WorkBuddyCheckin: 开始执行 Trae 签到")
-            result = self._run_with_timeout("Trae", self._trae_do_checkin, 150, "trae")
+            result = self._run_with_timeout("Trae", self._trae_do_checkin, 600, "trae")
             logger.info(
                 f"WorkBuddyCheckin: Trae 签到结果 -> {result.get('status')} | "
                 f"{(result.get('text') or '').splitlines()[0] if result.get('text') else ''}"
             )
             results.append(result)
         elif self._trae_enabled:
-            logger.warn("WorkBuddyCheckin: Trae 已启用但未配置 accessToken/refreshToken，跳过")
+            logger.warning("WorkBuddyCheckin: Trae 已启用但未配置 accessToken/refreshToken，跳过")
 
         return results
 
@@ -330,12 +341,27 @@ class WorkBuddyCheckin(_PluginBase):
             logger.error(f"WorkBuddyCheckin: 手动执行签到异常: {e}")
         logger.info("WorkBuddyCheckin: ===== 手动执行一次签到结束 =====")
 
-    def _scheduled_checkin(self):
-        """定时签到任务：按启用情况依次签到，合并为一条通知"""
-        logger.info("WorkBuddyCheckin: 定时签到任务开始")
-        results = self._collect_checkin_results()
-        self._notify_results(results)
-        logger.info("WorkBuddyCheckin: 定时签到任务结束")
+    def _scheduled_wb_checkin(self):
+        """定时任务：WorkBuddy 签到（独立时间、独立通知）"""
+        logger.info("WorkBuddyCheckin: 定时任务开始（WorkBuddy）")
+        result = self._run_with_timeout("WorkBuddy", self._do_checkin, 300, "checkin")
+        logger.info(
+            f"WorkBuddyCheckin: WorkBuddy 签到结果 -> {result.get('status')} | "
+            f"{(result.get('text') or '').splitlines()[0] if result.get('text') else ''}"
+        )
+        self._notify_results([result])
+        logger.info("WorkBuddyCheckin: 定时任务结束（WorkBuddy）")
+
+    def _scheduled_trae_checkin(self):
+        """定时任务：Trae 签到（可单独错峰，独立通知）"""
+        logger.info(f"WorkBuddyCheckin: 定时任务开始（Trae，cron={self._trae_cron}）")
+        result = self._run_with_timeout("Trae", self._trae_do_checkin, 600, "trae")
+        logger.info(
+            f"WorkBuddyCheckin: Trae 签到结果 -> {result.get('status')} | "
+            f"{(result.get('text') or '').splitlines()[0] if result.get('text') else ''}"
+        )
+        self._notify_results([result])
+        logger.info("WorkBuddyCheckin: 定时任务结束（Trae）")
 
     # ==================== 签到核心逻辑 ====================
 
@@ -418,7 +444,7 @@ class WorkBuddyCheckin(_PluginBase):
             config[f"last_{prefix}_result"] = title
             self.update_config(config)
         except Exception as e:
-            logger.warn(f"WorkBuddyCheckin: 保存签到记录失败: {e}")
+            logger.warning(f"WorkBuddyCheckin: 保存签到记录失败: {e}")
         return result
 
     def _refresh_token_api(self) -> dict:
@@ -589,10 +615,12 @@ class WorkBuddyCheckin(_PluginBase):
         return data
 
     def _trae_claim(self, access_token: str) -> dict:
-        """调用 Trae 领取签到积分接口，对 9074 限流做指数退避重试"""
+        """调用 Trae 领取签到积分接口，对 9074 高峰限流做带抖动的退避重试"""
+        attempts = 4
+        waits = (5, 10, 20)
         data = {}
-        for attempt in range(3):
-            logger.info(f"WorkBuddyCheckin: 请求 Trae 领取接口（第 {attempt + 1}/3 次）")
+        for attempt in range(attempts):
+            logger.info(f"WorkBuddyCheckin: 请求 Trae 领取接口（第 {attempt + 1}/{attempts} 次）")
             resp = self._session.post(
                 f"{self._trae_host}/trae/api/v2/ug/checkin_credits/claim",
                 headers=self._trae_headers(access_token), json={}, timeout=(5, 20)
@@ -607,14 +635,17 @@ class WorkBuddyCheckin(_PluginBase):
             )
             if resp.status_code in (401, 403):
                 raise TokenInvalidError(f"HTTP {resp.status_code} {data.get('message', '')}".strip())
-            # 9074 = 参与用户太多，指数退避重试
-            if data.get("code") == 9074:
-                wait = 2 ** attempt
-                logger.warn(f"WorkBuddyCheckin: Trae 签到限流 9074，{wait}s 后第 {attempt+2} 次重试")
+            # 9074 = 服务端高峰限流：带抖动退避后重试
+            if data.get("code") == 9074 and attempt < len(waits):
+                wait = waits[attempt] + secrets.randbelow(4)
+                logger.warning(
+                    f"WorkBuddyCheckin: Trae 领取接口限流 9074（第 {attempt + 1}/{attempts} 次），"
+                    f"{wait}s 后重试"
+                )
                 time.sleep(wait)
                 continue
             return data
-        return data  # 重试 3 次后仍然限流，返回最后一次结果
+        return data  # 重试后仍然限流，返回最后一次结果
 
     def _trae_do_checkin(self) -> dict:
         """执行 Trae 签到全流程：取 token（优先 accessToken）→ 查状态 → 未签则领取"""
@@ -663,6 +694,15 @@ class WorkBuddyCheckin(_PluginBase):
                 return self._finish(
                     "success", "Trae签到成功",
                     f"签到成功{gain_text}\n{summary}", prefix="trae")
+
+            if ccode == 9074:
+                return self._finish(
+                    "fail", "Trae签到失败：服务端高峰限流",
+                    "领取接口返回 9074「当前参与用户太多」，重试 4 次仍失败。\n"
+                    "这是 Trae 服务端的高峰限流，不是配置或令牌问题。\n"
+                    "建议把「Trae 签到时间」错开到凌晨低峰（如 5 0 * * *），"
+                    "或稍后手动执行一次",
+                    prefix="trae")
 
             return self._finish(
                 "fail", "Trae签到失败",
@@ -767,9 +807,9 @@ class WorkBuddyCheckin(_PluginBase):
                         "component": "VTextField",
                         "props": {
                             "model": "cron",
-                            "label": "签到时间（Cron）",
+                            "label": "WorkBuddy 签到时间（Cron）",
                             "placeholder": "0 8 * * *（每天8点）",
-                            "hint": "标准 Cron 表达式：分 时 日 月 周"
+                            "hint": "标准 Cron 表达式：分 时 日 月 周；仅影响 WorkBuddy"
                         }
                     },
                     {
@@ -849,6 +889,16 @@ class WorkBuddyCheckin(_PluginBase):
                     {
                         "component": "VTextField",
                         "props": {
+                            "model": "trae_cron",
+                            "label": "Trae 签到时间（Cron，可选）",
+                            "placeholder": "留空与 WorkBuddy 相同；建议错峰，如 5 0 * * *",
+                            "hint": "Trae 领取接口有高峰限流（9074「当前参与用户太多」），"
+                                    "把 Trae 单独放到凌晨低峰更容易成功，且不影响 WorkBuddy 的签到时间"
+                        }
+                    },
+                    {
+                        "component": "VTextField",
+                        "props": {
                             "model": "trae_host",
                             "label": "Trae API 地址",
                             "placeholder": "https://api.trae.cn",
@@ -913,6 +963,7 @@ class WorkBuddyCheckin(_PluginBase):
             "trae_uid": "",
             "trae_host": "https://api.trae.cn",
             "trae_client_id": "",
+            "trae_cron": "",
             "trae_device_id": "",
             "trae_machine_id": "",
             "run_once": False,
