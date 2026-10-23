@@ -42,7 +42,7 @@ class WorkBuddyCheckin(_PluginBase):
     # 插件元数据
     plugin_name = "WorkBuddyCheckin"
     plugin_desc = "WorkBuddy 与 Trae 每日自动签到：自动领取积分，支持手动一键签到、远程触发、消息通知策略。"
-    plugin_version = "1.3.1"
+    plugin_version = "1.3.2"
     plugin_author = "Cxquang"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/autosignin.png"
     plugin_order = 100
@@ -762,6 +762,87 @@ class WorkBuddyCheckin(_PluginBase):
                             "hint": "对应客户端 telemetry.machineId；留空则首次启用时自动生成并保存"
                         }
                     },
+                    {
+                        "component": "VDivider",
+                        "props": {"class": "my-3"},
+                    },
+                    {
+                        "component": "div",
+                        "props": {"class": "d-flex gap-2 flex-wrap"},
+                        "content": [
+                            {
+                                "component": "VBtn",
+                                "props": {
+                                    "color": "primary",
+                                    "variant": "flat",
+                                    "size": "small",
+                                    "prepend-icon": "mdi-cash-check",
+                                    "class": "mr-1",
+                                },
+                                "text": "WorkBuddy 立即签到",
+                                "events": {
+                                    "click": {
+                                        "api": f"plugin/{self.__class__.__name__}/checkin?apikey={settings.API_TOKEN}",
+                                        "method": "get",
+                                    }
+                                },
+                            },
+                            {
+                                "component": "VBtn",
+                                "props": {
+                                    "color": "secondary",
+                                    "variant": "tonal",
+                                    "size": "small",
+                                    "prepend-icon": "mdi-information-outline",
+                                },
+                                "text": "WorkBuddy 查询状态",
+                                "events": {
+                                    "click": {
+                                        "api": f"plugin/{self.__class__.__name__}/status?apikey={settings.API_TOKEN}",
+                                        "method": "get",
+                                    }
+                                },
+                            },
+                            {
+                                "component": "VBtn",
+                                "props": {
+                                    "color": "primary",
+                                    "variant": "flat",
+                                    "size": "small",
+                                    "prepend-icon": "mdi-cash-check",
+                                    "class": "mr-1",
+                                },
+                                "text": "Trae 立即签到",
+                                "events": {
+                                    "click": {
+                                        "api": f"plugin/{self.__class__.__name__}/trae_checkin?apikey={settings.API_TOKEN}",
+                                        "method": "get",
+                                    }
+                                },
+                            },
+                            {
+                                "component": "VBtn",
+                                "props": {
+                                    "color": "secondary",
+                                    "variant": "tonal",
+                                    "size": "small",
+                                    "prepend-icon": "mdi-information-outline",
+                                },
+                                "text": "Trae 查询状态",
+                                "events": {
+                                    "click": {
+                                        "api": f"plugin/{self.__class__.__name__}/trae_status?apikey={settings.API_TOKEN}",
+                                        "method": "get",
+                                    }
+                                },
+                            },
+                        ],
+                    },
+                    {
+                        "component": "div",
+                        "props": {"class": "text-body-2 text-medium-emphasis mt-1"},
+                        "text": "按钮点击后由 MoviePilot 插件后端执行，执行结果与完整请求链路请在 MoviePilot「日志中心」查看"
+                    },
                 ]
             }
         ], {
@@ -793,123 +874,65 @@ class WorkBuddyCheckin(_PluginBase):
         }
 
     def get_page(self) -> List[dict]:
-        """详情页：签到状态展示 + 一键签到按钮"""
+        """详情页：仅展示缓存的上次签到结果（不做任何实时网络请求，避免页面卡住）"""
         config = self.get_config() or {}
         last_time = config.get("last_checkin_time", "")
         last_result = config.get("last_checkin_result", "")
-
-        # 实时查询签到状态（尽力而为，失败不阻塞页面）
-        status = {}
-        status_error = ""
-        if self._refresh_token:
-            try:
-                status = self._get_checkin_status()
-            except Exception as e:
-                status_error = str(e)
-
-        status_rows = []
-        if status:
-            if "today_checked_in" in status:
-                checked = status.get("today_checked_in")
-                status_rows.append(self._stat_row(
-                    "今日签到", "已签到" if checked else "未签到",
-                    "text-success" if checked else "text-error"))
-            if "streak_days" in status:
-                status_rows.append(self._stat_row("连续签到", f'{status.get("streak_days")} 天'))
-            if "total_credits" in status:
-                status_rows.append(self._stat_row("累计积分", f'{status.get("total_credits")} 分'))
-        elif status_error:
-            status_rows.append({
-                "component": "div",
-                "props": {"class": "px-4 py-1 text-error text-body-2"},
-                "text": f"状态查询失败（不影响手动签到）：{status_error}",
-            })
-        elif not self._refresh_token:
-            status_rows.append({
-                "component": "div",
-                "props": {"class": "px-4 py-1 text-medium-emphasis"},
-                "text": "尚未配置 refreshToken，请先在插件配置中填写",
-            })
-
-        # 上次签到结果
-        if last_result:
-            status_rows.append(self._stat_row("上次签到", f"{last_result}（{last_time}）"))
-
-        # ---- Trae 状态 ----
         trae_last_time = config.get("last_trae_time", "")
         trae_last_result = config.get("last_trae_result", "")
-        trae_status = {}
-        trae_error = ""
-        if (self._trae_access_token or self._trae_refresh_token) and self._trae_uid:
-            try:
-                trae_status = self._trae_get_status(self._trae_get_access_token())
-            except Exception as e:
-                trae_error = str(e)
+
+        wb_rows = []
+        if self._refresh_token:
+            wb_rows.append(self._stat_row("已配置", "是", "text-success"))
+        else:
+            wb_rows.append(self._stat_row("已配置", "否", "text-warning"))
+        wb_rows.append(self._stat_row("签到时间", config.get("cron", "0 8 * * *")))
+        wb_rows.append(self._stat_row(
+            "通知策略", {
+                "always": "每次通知",
+                "fail": "仅失败通知",
+                "off": "关闭通知",
+            }.get(config.get("notify_mode", "always"), config.get("notify_mode"))
+        ))
+        if last_result:
+            wb_rows.append(self._stat_row("上次签到", f"{last_result}（{last_time}）"))
 
         trae_rows = []
-        if trae_status:
-            if "checked_in" in trae_status:
-                checked = trae_status.get("checked_in")
-                trae_rows.append(self._stat_row(
-                    "今日签到", "已签到" if checked else "未签到",
-                    "text-success" if checked else "text-error"))
-            if "credits" in trae_status:
-                trae_rows.append(self._stat_row("基础积分", f'{trae_status.get("credits")} 分'))
-            if trae_status.get("extra_credits") is not None:
-                trae_rows.append(self._stat_row("额外积分", f'{trae_status.get("extra_credits")} 分'))
-        elif trae_error:
-            trae_rows.append({
-                "component": "div",
-                "props": {"class": "px-4 py-1 text-error text-body-2"},
-                "text": f"状态查询失败（不影响手动签到）：{trae_error}",
-            })
-        elif not self._trae_access_token and not self._trae_refresh_token:
-            trae_rows.append({
-                "component": "div",
-                "props": {"class": "px-4 py-1 text-medium-emphasis"},
-                "text": "尚未配置 Trae accessToken 或 refreshToken，请先在插件配置中填写",
-            })
-        elif not self._trae_uid:
-            trae_rows.append({
-                "component": "div",
-                "props": {"class": "px-4 py-1 text-warning text-body-2"},
-                "text": "尚未配置 Trae User ID，请先在插件配置中填写",
-            })
+        if self._trae_access_token or self._trae_refresh_token:
+            trae_rows.append(self._stat_row("已配置", "是", "text-success"))
+        else:
+            trae_rows.append(self._stat_row("已配置", "否", "text-warning"))
+        if self._trae_access_token:
+            trae_rows.append(self._stat_row("令牌来源", "Access Token（直连）"))
+        elif self._trae_refresh_token:
+            trae_rows.append(self._stat_row("令牌来源", "RefreshToken（自动续期）"))
+        if self._trae_uid:
+            trae_rows.append(self._stat_row("User ID", self._trae_uid))
         if trae_last_result:
             trae_rows.append(self._stat_row("上次签到", f"{trae_last_result}（{trae_last_time}）"))
 
         return [
+            {
+                "component": "VAlert",
+                "props": {
+                    "type": "info", "variant": "tonal", "density": "compact",
+                    "text": "手动签到与状态查询按钮已迁移到「插件设置」，"
+                            "本页面仅展示缓存结果避免因网络请求阻塞。"
+                }
+            },
             {
                 "component": "VCard",
                 "props": {"variant": "tonal"},
                 "content": [
                     {
                         "component": "div",
-                        "props": {"class": "d-flex align-center px-4 pt-3 pb-1"},
+                        "props": {"class": "px-4 pt-3 pb-1"},
                         "content": [
                             {"component": "span", "props": {"class": "text-h6"}, "text": "WorkBuddy 签到"},
-                            {"component": "VSpacer"},
-                            {
-                                "component": "VBtn",
-                                "props": {
-                                    "color": "primary",
-                                    "size": "small",
-                                    "variant": "flat",
-                                    "prepend-icon": "mdi-cash-check",
-                                    "class": "mb-1",
-                                },
-                                "text": "立即签到",
-                                "events": {
-                                    "click": {
-                                        "api": f"plugin/{self.__class__.__name__}/checkin?apikey={settings.API_TOKEN}",
-                                        "method": "get",
-                                    }
-                                },
-                            },
                         ],
                     },
-                    *status_rows,
-                ],
+                    *wb_rows,
+                ]
             },
             {
                 "component": "VCard",
@@ -917,31 +940,13 @@ class WorkBuddyCheckin(_PluginBase):
                 "content": [
                     {
                         "component": "div",
-                        "props": {"class": "d-flex align-center px-4 pt-3 pb-1"},
+                        "props": {"class": "px-4 pt-3 pb-1"},
                         "content": [
                             {"component": "span", "props": {"class": "text-h6"}, "text": "Trae 签到"},
-                            {"component": "VSpacer"},
-                            {
-                                "component": "VBtn",
-                                "props": {
-                                    "color": "primary",
-                                    "size": "small",
-                                    "variant": "flat",
-                                    "prepend-icon": "mdi-cash-check",
-                                    "class": "mb-1",
-                                },
-                                "text": "立即签到",
-                                "events": {
-                                    "click": {
-                                        "api": f"plugin/{self.__class__.__name__}/trae_checkin?apikey={settings.API_TOKEN}",
-                                        "method": "get",
-                                    }
-                                },
-                            },
                         ],
                     },
                     *trae_rows,
-                ],
+                ]
             },
         ]
 
