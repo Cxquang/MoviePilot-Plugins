@@ -89,7 +89,7 @@ class BotHostingRenew(_PluginBase):
     # 插件图标
     plugin_icon = "https://bot-hosting.net/favicon.ico"
     # 插件版本
-    plugin_version = "1.3.1"
+    plugin_version = "1.3.2"
     # 插件作者
     plugin_author = "Cxquang"
     # 作者主页
@@ -328,7 +328,7 @@ class BotHostingRenew(_PluginBase):
                 "success": False,
                 "title": "状态查询失败",
                 "detail": f"{status.get('error')}\n"
-                          "容器无法访问 bot-hosting.net，请检查网络或填写代理。",
+                          "容器无法访问 bot-hosting.net，请检查网络连接（浏览器与站点接口为直连，不走代理）。",
                 "time": self.__now_str(),
             }
 
@@ -446,9 +446,9 @@ class BotHostingRenew(_PluginBase):
             "title": "自动续期失败",
             "detail": f"失败原因：{err}{diag_text}{logs_text}\n"
                       "排查建议：\n"
-                      "1. 确认容器可访问 bot-hosting.net 与 challenges.cloudflare.com（Turnstile 依赖后者）\n"
-                      "2. 若服务器在墙内，请在插件配置中填写代理（http://user:pass@host:port）\n"
-                      "3. 开启「GitHub Actions 备用方案」并填写 Token，浏览器失败时由 Action 兜底\n"
+                      "1. 确认容器可直连 bot-hosting.net 与 challenges.cloudflare.com（Turnstile 依赖后者，浏览器不走代理）\n"
+                      "2. 容器内安装 xvfb 与 xdotool 后可启用有头模式点击，过验证更稳\n"
+                      "3. 开启「GitHub Actions 备用方案」并填写 Token，浏览器失败时由 Action 兜底（Action 调用走代理）\n"
                       "4. 仍失败时请手动登录续期一次。",
             "expiry": expiry,
             "login_method": login_method,
@@ -470,7 +470,6 @@ class BotHostingRenew(_PluginBase):
                 BILLINGS_URL,
                 headers={"User-Agent": USER_AGENT, "Accept": "text/html"},
                 cookies={"session_token": session_token, "login": "true", "theme": "system"},
-                proxies=self.__req_proxies(),
                 timeout=30, allow_redirects=False,
             )
         except Exception as e:
@@ -547,13 +546,13 @@ class BotHostingRenew(_PluginBase):
             logs.append(msg)
 
         if self._proxy:
-            log(f"使用代理: {self.__mask_proxy(self._proxy)}")
+            log("浏览器直连访问 bot-hosting（家用网络干净时不走代理），代理仅用于 GitHub API")
 
         browser = None
         xvfb_proc = None
         try:
             with sync_playwright() as p:
-                browser, xvfb_proc = self.__launch_chromium(p, self._proxy, log)
+                browser, xvfb_proc = self.__launch_chromium(p, "", log)
 
                 context = browser.new_context(
                     user_agent=USER_AGENT,
@@ -860,8 +859,6 @@ class BotHostingRenew(_PluginBase):
             "args": ["--no-sandbox", "--disable-dev-shm-usage",
                      "--disable-blink-features=AutomationControlled", "--disable-gpu"],
         }
-        if self._proxy:
-            launch_kwargs["proxy"] = {"server": self._proxy}
         with sync_playwright() as p:
             try:
                 browser = p.chromium.launch(**launch_kwargs)
@@ -1127,11 +1124,11 @@ class BotHostingRenew(_PluginBase):
         return ""
 
     def __check_turnstile_net(self) -> str:
-        """从容器直接探测 Turnstile 脚本是否可达，便于定位网络/代理问题"""
+        """从容器直接探测 Turnstile 脚本是否可达（直连，与浏览器一致），便于定位网络问题"""
         try:
             r = requests.get(TURNSTILE_API,
                              headers={"User-Agent": USER_AGENT},
-                             proxies=self.__req_proxies(), timeout=15)
+                             timeout=15)
             return f"HTTP {r.status_code}, {len(r.content)} bytes"
         except Exception as e:
             return f"失败: {e}"
@@ -1296,6 +1293,7 @@ class BotHostingRenew(_PluginBase):
         return re.sub(r"//([^:@/]+):([^@/]+)@", r"//\1:***@", proxy)
 
     def __req_proxies(self) -> Optional[dict]:
+        """仅 GitHub API 备用方案使用代理；浏览器与站点接口一律直连（家用网络干净）"""
         if not self._proxy:
             return None
         return {"http": self._proxy, "https": self._proxy}
@@ -1311,7 +1309,6 @@ class BotHostingRenew(_PluginBase):
         try:
             # 1. 获取 state
             r1 = requests.get(DISCORD_LOGIN_URL, headers={"User-Agent": USER_AGENT},
-                              proxies=self.__req_proxies(),
                               timeout=30, allow_redirects=False)
             if r1.status_code not in (301, 302, 303, 307):
                 logger.error(f"Bot-Hosting Discord 登录页异常: HTTP {r1.status_code}")
@@ -1352,7 +1349,6 @@ class BotHostingRenew(_PluginBase):
                         "channel_type": 10000,
                     },
                 },
-                proxies=self.__req_proxies(),
                 timeout=30,
             )
             if r2.status_code != 200:
@@ -1366,7 +1362,6 @@ class BotHostingRenew(_PluginBase):
             # 3. 回调捕获 session_token
             sess = requests.Session()
             sess.headers.update({"User-Agent": USER_AGENT})
-            sess.proxies.update(self.__req_proxies() or {})
             r3 = sess.get(callback, timeout=30)
             if "/error/banned" in r3.url:
                 logger.error("Bot-Hosting 账号已被封禁")
@@ -1661,8 +1656,8 @@ class BotHostingRenew(_PluginBase):
                                     "component": "VTextField",
                                     "props": {
                                         "model": "proxy",
-                                        "label": "代理（可选）",
-                                        "placeholder": "http://user:pass@host:port，留空直连",
+                                        "label": "代理（可选，仅 GitHub API 用）",
+                                        "placeholder": "http://user:pass@host:port，留空直连；浏览器模拟与站点接口始终直连不走代理",
                                     },
                                 }]
                             },
@@ -1720,15 +1715,15 @@ class BotHostingRenew(_PluginBase):
                                     "props": {
                                         "type": "info",
                                         "variant": "tonal",
-                                        "text": "登录优先使用账户邮箱+密码（密码不会过期）；未填密码时才用 Session Token，失效再走 Discord OAuth 换新。"
-                                                "每天定时检查：距到期不足 24 小时才执行续期，先用 Playwright 无头 Chromium 模拟点击「Renew free plan」，"
-                                                "通过 Turnstile 后点「Renew for 4 days」；失败且开启备用方案时，通过 GitHub API 触发 Action，"
-                                                "并轮询结果后推送企业微信，最后核对一次到期日。"
-                                                "GitHub PAT 需 Actions 读写权限（细粒度：Actions Read and write；经典：repo + workflow）。"
-                                                "GitHub API 走直连 api.github.com（可复用下方代理），MP 的 gh-proxy 只用于下载，不用于 API 触发。"
-                                                "首次运行会自动下载 Chromium（约 150MB），保存在 /config/.playwright。"
-                                                "容器必须能访问 bot-hosting.net、challenges.cloudflare.com 和 api.github.com。"
-                                                "修改配置后可开启「立即执行一次」验证，结果按通知策略推送。",
+                                        "text": "登录优先使用 Session Token（免登录页人机验证），token 失效/未填时才用账户邮箱+密码登录（登录页也过 Turnstile），无密码时可走 Discord OAuth 换新。"
+                                        "每天定时检查：距到期不足 24 小时才执行续期，先用 Chromium 模拟点击「Renew free plan」（容器内有 Xvfb 时用有头模式 + xdotool 真实点击，"
+                                        "需镜像支持 xvfb/xdotool，建议 apk add xvfb xdotool），通过 Turnstile 后点「Renew for 4 days」；失败且开启备用方案时，通过 GitHub API 触发 Action，"
+                                        "并轮询结果后推送企业微信，最后核对一次到期日。"
+                                        "浏览器与站点接口一律直连（家用网络干净，代理节点反而容易被 Cloudflare 风控）；代理只供 GitHub API 触发 Action 时使用，留空则直连。"
+                                        "GitHub PAT 需 Actions 读写权限（细粒度：Actions Read and write；经典：repo + workflow）。"
+                                        "首次运行会自动下载 Chromium（约 150MB），保存在 /config/.playwright。"
+                                        "容器必须能访问 bot-hosting.net、challenges.cloudflare.com 和 api.github.com。"
+                                        "修改配置后可开启「立即执行一次」验证，结果按通知策略推送。",
                                     },
                                 }]
                             },
