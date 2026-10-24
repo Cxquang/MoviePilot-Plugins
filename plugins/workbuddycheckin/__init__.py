@@ -22,6 +22,7 @@ from app.core.config import settings
 from app.core.event import eventmanager, EventType
 from app.log import logger
 from app.plugins import _PluginBase
+from app.schemas.types import NotificationType
 
 # Trae 客户端固定参数（逆向自官方客户端，客户端大版本升级后可能需要同步调整）
 TRAE_APP_ID = "6eefa01c-1036-4c7e-9ca5-d891f63bfcd8"
@@ -43,7 +44,7 @@ class WorkBuddyCheckin(_PluginBase):
     # 插件元数据
     plugin_name = "WorkBuddyCheckin"
     plugin_desc = "WorkBuddy 与 Trae 每日自动签到：自动领取积分，支持设置页保存后立即执行一次、定时签到、远程触发、消息通知策略。"
-    plugin_version = "1.5.1"
+    plugin_version = "1.6.0"
     plugin_author = "Cxquang"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/autosignin.png"
     plugin_order = 100
@@ -55,6 +56,7 @@ class WorkBuddyCheckin(_PluginBase):
     _uid = ""
     _cron = "0 8 * * *"
     _notify_mode = "always"  # always=每次通知 / fail=仅失败通知 / off=关闭通知
+    _message_type = ""  # 通知消息类型（NotificationType 名称），留空=不指定，发送到全部渠道
     _base_url = "https://www.workbuddy.cn"
     _session = None
     # Trae 配置
@@ -80,6 +82,9 @@ class WorkBuddyCheckin(_PluginBase):
         if not notify_mode:
             notify_mode = "off" if config.get("notify") is False else "always"
         self._notify_mode = notify_mode if notify_mode in ("always", "fail", "off") else "always"
+        # 通知消息类型：留空表示不指定（不受「设定-通知-消息类型」开关限制，发全部渠道）
+        message_type = (config.get("message_type") or "").strip()
+        self._message_type = message_type if message_type in {t.name for t in NotificationType} else ""
         # Trae 配置
         self._trae_enabled = config.get("trae_enabled", False)
         self._trae_access_token = (config.get("trae_access_token") or "").strip()
@@ -774,8 +779,14 @@ class WorkBuddyCheckin(_PluginBase):
             text = "\n\n".join(
                 f"{r.get('title', '')}\n{r.get('text', '')}".strip() for r in results)
         try:
-            self.post_message(title=title, text=text)
-            logger.info(f"WorkBuddyCheckin: 通知已发送 -> {title}")
+            kwargs = {"title": title, "text": text}
+            if self._message_type:
+                kwargs["mtype"] = NotificationType[self._message_type]
+            self.post_message(**kwargs)
+            logger.info(
+                f"WorkBuddyCheckin: 通知已发送（消息类型: "
+                f"{self._message_type or '未指定，全部渠道'}） -> {title}"
+            )
         except Exception as e:
             logger.error(f"WorkBuddyCheckin: 发送通知失败: {e}")
 
@@ -837,6 +848,22 @@ class WorkBuddyCheckin(_PluginBase):
                         }
                     },
                     {
+                        "component": "VSelect",
+                        "props": {
+                            "model": "message_type",
+                            "label": "通知消息类型",
+                            "items": [
+                                {"title": "不指定（发送到全部渠道）", "value": ""},
+                                *[{"title": f"{t.value}（{t.name}）", "value": t.name}
+                                  for t in NotificationType],
+                            ],
+                            "hint": "对应「设定-通知-消息类型」中的分类开关；"
+                                    "不指定则不受分类开关限制，消息发到全部已启用渠道。"
+                                    "签到类消息一般选「插件」",
+                            "persistent-hint": True,
+                        }
+                    },
+                    {
                         "component": "VAlert",
                         "props": {
                             "type": "info",
@@ -845,7 +872,7 @@ class WorkBuddyCheckin(_PluginBase):
                             "class": "mt-2 mb-1",
                             "text": "Trae 签到（api.trae.cn）：建议直接填 Access Token，"
                                     "绕过 refreshToken 换 token 步骤（不同客户端版本的 ClientID 可能不同）；"
-                                    "与 WorkBuddy 共用上面的签到时间与通知策略"
+                                    "与 WorkBuddy 共用上面的签到时间、通知策略与消息类型"
                         }
                     },
                     {
@@ -980,6 +1007,7 @@ class WorkBuddyCheckin(_PluginBase):
             "uid": "",
             "cron": "0 8 * * *",
             "notify_mode": "always",
+            "message_type": "",
             "trae_enabled": False,
             "trae_access_token": "",
             "trae_refresh_token": "",
@@ -1025,6 +1053,11 @@ class WorkBuddyCheckin(_PluginBase):
                 "fail": "仅失败通知",
                 "off": "关闭通知",
             }.get(config.get("notify_mode", "always"), config.get("notify_mode"))
+        ))
+        mtype_name = (config.get("message_type") or "").strip()
+        wb_rows.append(self._stat_row(
+            "消息类型",
+            {t.name: t.value for t in NotificationType}.get(mtype_name, "未指定（全部渠道）")
         ))
         if last_result:
             wb_rows.append(self._stat_row("上次签到", f"{last_result}（{last_time}）"))
