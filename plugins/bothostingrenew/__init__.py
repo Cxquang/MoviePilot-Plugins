@@ -89,7 +89,7 @@ class BotHostingRenew(_PluginBase):
     # 插件图标
     plugin_icon = "https://bot-hosting.net/favicon.ico"
     # 插件版本
-    plugin_version = "1.3.3"
+    plugin_version = "1.3.4"
     # 插件作者
     plugin_author = "Cxquang"
     # 作者主页
@@ -503,14 +503,19 @@ class BotHostingRenew(_PluginBase):
 
     @staticmethod
     def __extract_json_str(html: str, field: str) -> Optional[str]:
-        """从 SSR HTML 的序列化数据中提取字符串/数字字段值（兼容引号与时间戳）"""
-        m = re.search(rf'["\']{field}["\']\s*:\s*["\']([^"\']+)["\']', html)
+        """从 SSR HTML 的序列化数据中提取字符串/数字字段值
+
+        页面序列化的键名可能不带引号（freeRenewalDueAt:"2026-10-28T00:07:50.507Z"），
+        也可能带引号（"freeRenewalDueAt":"..."），这里兼容两种写法。
+        """
+        f = re.escape(field)
+        m = re.search(rf'(?<![\w"\'])(["\']?){f}\1\s*:\s*["\']([^"\']+)["\']', html)
         if m:
-            return m.group(1)
+            return m.group(2)
         # 时间戳形式（毫秒/秒）→ UTC+8 的 YYYY/MM/DD
-        m = re.search(rf'["\']{field}["\']\s*:\s*(\d{{10,13}})', html)
+        m = re.search(rf'(?<![\w"\'])(["\']?){f}\1\s*:\s*(\d{{10,13}})', html)
         if m:
-            ts = int(m.group(1))
+            ts = int(m.group(2))
             if ts > 10_000_000_000:
                 ts = int(ts / 1000)
             try:
@@ -525,6 +530,13 @@ class BotHostingRenew(_PluginBase):
         m = re.search(r"Expires?\s*[:\-]?\s*(\d{4}[/-]\d{1,2}[/-]\d{1,2})", html, re.I)
         if m:
             return m.group(1).replace("-", "/")
+        # 美式 MM/DD/YYYY（页面文本：Expires 10/28/2026）
+        m = re.search(r"Expires?\s*[:\-]?\s*(\d{1,2}/\d{1,2}/\d{4})", html, re.I)
+        if m:
+            try:
+                return datetime.strptime(m.group(1), "%m/%d/%Y").strftime("%Y/%m/%d")
+            except ValueError:
+                return None
         m = re.search(
             r"Expires?\s*[:\-]?\s*(\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s+\d{4})",
             html, re.I)
