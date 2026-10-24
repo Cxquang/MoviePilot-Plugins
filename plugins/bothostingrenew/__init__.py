@@ -89,7 +89,7 @@ class BotHostingRenew(_PluginBase):
     # 插件图标
     plugin_icon = "https://bot-hosting.net/favicon.ico"
     # 插件版本
-    plugin_version = "1.3.2"
+    plugin_version = "1.3.3"
     # 插件作者
     plugin_author = "Cxquang"
     # 作者主页
@@ -491,20 +491,62 @@ class BotHostingRenew(_PluginBase):
         result["opens_at"] = self.__extract_json_str(html, "freeRenewalOpensAt")
         result["tier"] = self.__extract_json_str(html, "accountTier")
         result["status"] = self.__extract_json_str(html, "status")
-        # 回退：页面文本日期
+        # 回退：页面文本日期（多格式），仍失败则输出诊断片段
         if not result["expiry"]:
-            m = re.search(r"Expires\s*[:\-]?\s*(\d{4}/\d{2}/\d{2})", html)
-            if m:
-                result["expiry"] = m.group(1)
+            result["expiry"] = self.__parse_expiry_fallback(html)
+            if not result["expiry"]:
+                logger.warn("[BotHosting] 账单页未解析到到期时间，输出诊断片段：")
+                self.__log_expiry_diag(html)
         logger.info(f"Bot-Hosting 状态: tier={result['tier']} status={result['status']} "
                     f"到期={result['expiry']} 可续期={result['opens_at']}")
         return result
 
     @staticmethod
     def __extract_json_str(html: str, field: str) -> Optional[str]:
-        """从 SSR HTML 的序列化数据中提取字符串字段值"""
-        m = re.search(rf'"{field}"\s*:\s*"([^"]+)"', html)
-        return m.group(1) if m else None
+        """从 SSR HTML 的序列化数据中提取字符串/数字字段值（兼容引号与时间戳）"""
+        m = re.search(rf'["\']{field}["\']\s*:\s*["\']([^"\']+)["\']', html)
+        if m:
+            return m.group(1)
+        # 时间戳形式（毫秒/秒）→ UTC+8 的 YYYY/MM/DD
+        m = re.search(rf'["\']{field}["\']\s*:\s*(\d{{10,13}})', html)
+        if m:
+            ts = int(m.group(1))
+            if ts > 10_000_000_000:
+                ts = int(ts / 1000)
+            try:
+                return time.strftime("%Y/%m/%d", time.gmtime(ts + 8 * 3600))
+            except Exception:
+                return None
+        return None
+
+    @staticmethod
+    def __parse_expiry_fallback(html: str) -> Optional[str]:
+        """JSON 字段缺失时，从页面文本回退解析到期时间（多种日期格式）"""
+        m = re.search(r"Expires?\s*[:\-]?\s*(\d{4}[/-]\d{1,2}[/-]\d{1,2})", html, re.I)
+        if m:
+            return m.group(1).replace("-", "/")
+        m = re.search(
+            r"Expires?\s*[:\-]?\s*(\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s+\d{4})",
+            html, re.I)
+        if m:
+            try:
+                return time.strftime("%Y/%m/%d", time.strptime(m.group(1), "%d %b %Y"))
+            except ValueError:
+                return None
+        return None
+
+    @staticmethod
+    def __log_expiry_diag(html: str):
+        """到期时间解析失败时，记录页面候选片段用于定位结构变化"""
+        try:
+            for kw in ("freeRenewalDueAt", "freeRenewalOpensAt", "Expires", "Renew", "renew"):
+                for m in list(re.finditer(re.escape(kw), html))[:3]:
+                    s = max(0, m.start() - 100)
+                    seg = html[s:m.end() + 160].replace("\n", " ").replace("\r", " ")
+                    logger.info(f"[BotHosting][诊断] 关键词[{kw}]: ...{seg}...")
+                    break
+        except Exception:
+            pass
 
     def __do_renew(self, session_token: str) -> dict:
         """浏览器续期入口
@@ -614,7 +656,12 @@ class BotHostingRenew(_PluginBase):
                             "error": "账单页未找到可用的续期按钮（可能尚未到可续期时间，或页面结构变化）"}
                 try:
                     if not renew_btn.is_enabled():
-                        return {"ok": False, "error": "续期按钮当前不可用（尚未到可续期时间/冷却中）"}
+                        cd = self.__read_button_cooldown(page)
+                        msg = "续期按钮当前不可用（尚未到可续期时间/冷却中）"
+                        if cd:
+                            msg += f"，按钮提示：{cd}"
+                            log(f"续期按钮冷却提示: {cd}")
+                        return {"ok": False, "error": msg}
                 except Exception:
                     pass
                 log("找到续期按钮，点击打开弹窗...")
@@ -1276,7 +1323,7 @@ class BotHostingRenew(_PluginBase):
             return {"snapshot_error": str(e)}
 
     def __read_expiry_from_page(self, page) -> Optional[str]:
-        """从当前页面 HTML 中提取到期时间（优先 SSR JSON）"""
+        """从当前页面 HTML 中提取到期时间（SSR JSON → 多格式文本回退）"""
         try:
             html = page.content()
         except Exception:
@@ -1284,8 +1331,25 @@ class BotHostingRenew(_PluginBase):
         val = self.__extract_json_str(html, "freeRenewalDueAt")
         if val:
             return val
-        m = re.search(r"Expires\s*[:\-]?\s*(\d{4}/\d{2}/\d{2})", html)
-        return m.group(1) if m else None
+        return self.__parse_expiry_fallback(html)
+
+    @staticmethod
+    def __read_button_cooldown(page) -> Optional[str]:
+        """读取续期按钮上的倒计时/剩余时间文字（按钮不可用时展示）"""
+        try:
+            txt = page.evaluate("""() => {
+                const btns = [...document.querySelectorAll('button, a, [role="button"]')];
+                const b = btns.find(x => /renew/i.test(x.textContent || ''));
+                if (b && b.textContent && b.textContent.trim()) return b.textContent.trim();
+                const m = document.body.innerText.match(/renew[^\\n]{0,100}/i);
+                if (m) return m[0].replace(/\\s+/g, ' ').trim();
+                return '';
+            }""")
+            if not txt:
+                return None
+            return txt[:100]
+        except Exception:
+            return None
 
     @staticmethod
     def __mask_proxy(proxy: str) -> str:
