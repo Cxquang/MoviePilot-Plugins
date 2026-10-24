@@ -43,7 +43,7 @@ class WorkBuddyCheckin(_PluginBase):
     # 插件元数据
     plugin_name = "WorkBuddyCheckin"
     plugin_desc = "WorkBuddy 与 Trae 每日自动签到：自动领取积分，支持设置页保存后立即执行一次、定时签到、远程触发、消息通知策略。"
-    plugin_version = "1.5.0"
+    plugin_version = "1.5.1"
     plugin_author = "Cxquang"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/autosignin.png"
     plugin_order = 100
@@ -89,6 +89,12 @@ class WorkBuddyCheckin(_PluginBase):
         self._trae_device_id = (config.get("trae_device_id") or "").strip()
         self._trae_machine_id = (config.get("trae_machine_id") or "").strip()
         self._trae_client_id = (config.get("trae_client_id") or "").strip()
+        # Trae 客户端版本：填写真实客户端版本（如 2.3.76922），版本和随机设备指纹
+        # 是服务端 9074 风控的关键维度——实测：真实指纹+真实版本 code=0 成功，
+        # 随机指纹+旧版本 code=9074 拒绝
+        self._trae_ide_version = (config.get("trae_ide_version") or "").strip() or TRAE_IDE_VERSION
+        self._trae_ide_version_code = self._trae_ide_version.replace(".", "") \
+            if self._trae_ide_version != TRAE_IDE_VERSION else TRAE_IDE_VERSION_CODE
         # Trae 独立签到时间：留空则与 WorkBuddy 共用主签到时间
         self._trae_cron = (config.get("trae_cron") or "").strip() or self._cron
         self._session = requests.Session()
@@ -98,22 +104,22 @@ class WorkBuddyCheckin(_PluginBase):
         if self._trae_enabled and (not self._trae_access_token and not self._trae_refresh_token):
             logger.warning("WorkBuddyCheckin: Trae 已启用但 accessToken 和 refreshToken 都未配置，请先配置")
 
-        # Trae 设备指纹需长期稳定，首次使用时生成并写入配置
-        if self._trae_enabled and (not self._trae_device_id or not self._trae_machine_id):
-            changed = False
-            if not self._trae_device_id:
-                self._trae_device_id = hashlib.sha256(secrets.token_hex(32).encode()).hexdigest()[:32]
-                config["trae_device_id"] = self._trae_device_id
-                changed = True
-            if not self._trae_machine_id:
-                self._trae_machine_id = secrets.token_hex(32)
-                config["trae_machine_id"] = self._trae_machine_id
-                changed = True
-            if changed:
-                try:
-                    self.update_config(config)
-                except Exception as e:
-                    logger.warning(f"WorkBuddyCheckin: 保存 Trae 设备指纹失败: {e}")
+        # Trae 设备指纹需长期稳定，首次使用时生成并写入配置。
+        # 注意：随机生成的指纹会在领取积分时被服务端 9074 风控，
+        # 建议在表单中填写客户端真实 Device ID（iCubeAuthInfo://icube-dc:<数字>）
+        if self._trae_enabled and not self._trae_device_id:
+            self._trae_device_id = hashlib.sha256(secrets.token_hex(32).encode()).hexdigest()[:32]
+            config["trae_device_id"] = self._trae_device_id
+            try:
+                self.update_config(config)
+            except Exception as e:
+                logger.warning(f"WorkBuddyCheckin: 保存 Trae 设备指纹失败: {e}")
+            logger.warning(
+                "WorkBuddyCheckin: 已自动生成随机 Trae Device ID。实测随机指纹领取积分会被"
+                "服务端以 9074「当前参与用户太多」风控；若签到持续报 9074，请到设置页填写"
+                "客户端真实 Device ID（storage.json 中 iCubeAuthInfo://icube-dc: 后面的数字）"
+                "以及真实客户端版本号"
+            )
 
         # 「保存后立即执行一次」开关：在后台线程执行一轮签到，不阻塞配置保存请求
         if config.get("run_once"):
@@ -533,8 +539,8 @@ class WorkBuddyCheckin(_PluginBase):
             "x-device-id": self._trae_device_id,
             "x-machine-id": self._trae_machine_id,
             "x-request-id": str(uuid.uuid4()),
-            "x-ide-version": TRAE_IDE_VERSION,
-            "x-ide-version-code": TRAE_IDE_VERSION_CODE,
+            "x-ide-version": self._trae_ide_version,
+            "x-ide-version-code": self._trae_ide_version_code,
             "x-device-type": device_type,
             "x-os-version": os_version,
             "Content-Type": "application/json",
@@ -697,11 +703,15 @@ class WorkBuddyCheckin(_PluginBase):
 
             if ccode == 9074:
                 return self._finish(
-                    "fail", "Trae签到失败：服务端高峰限流",
+                    "fail", "Trae签到失败：被服务端风控拦截",
                     "领取接口返回 9074「当前参与用户太多」，重试 4 次仍失败。\n"
-                    "这是 Trae 服务端的高峰限流，不是配置或令牌问题。\n"
-                    "建议把「Trae 签到时间」错开到凌晨低峰（如 5 0 * * *），"
-                    "或稍后手动执行一次",
+                    "该提示并非时段高峰，实测是 Trae 服务端对「陌生设备/旧版客户端」发放"
+                    "积分的风控拦截：客户端每天都能成功是因为它用的是真实绑定设备与真实版本号。\n"
+                    "解决办法：在插件设置页填写真实值——\n"
+                    "① Trae Device ID：storage.json 中 iCubeAuthInfo://icube-dc: 后面的数字"
+                    "（如 76313742634011）\n"
+                    "② Trae 客户端版本：客户端「帮助-关于」或 iCubeLastVersion（如 2.3.76922）\n"
+                    "其中 Device ID 起决定作用，填真实值后即可签到成功",
                     prefix="trae")
 
             return self._finish(
@@ -909,9 +919,11 @@ class WorkBuddyCheckin(_PluginBase):
                         "component": "VTextField",
                         "props": {
                             "model": "trae_device_id",
-                            "label": "Trae Device ID（可选）",
-                            "placeholder": "留空自动生成并固定",
-                            "hint": "对应客户端登录态里的 Device Id；建议填真实值，留空则首次启用时自动生成并保存"
+                            "label": "Trae Device ID（强烈建议填真实值）",
+                            "placeholder": "如 76313742634011",
+                            "hint": "即客户端登录态中 iCubeAuthInfo://icube-dc: 后面的数字。"
+                                    "实测：随机生成的指纹领取积分会被服务端以 9074「当前参与用户太多」风控拒绝，"
+                                    "真实指纹才能签到成功"
                         }
                     },
                     {
@@ -919,8 +931,19 @@ class WorkBuddyCheckin(_PluginBase):
                         "props": {
                             "model": "trae_machine_id",
                             "label": "Trae Machine ID（可选）",
-                            "placeholder": "留空自动生成并固定",
-                            "hint": "对应客户端 telemetry.machineId；留空则首次启用时自动生成并保存"
+                            "placeholder": "可留空",
+                            "hint": "实测留空/随机值不影响签到，可不填"
+                        }
+                    },
+                    {
+                        "component": "VTextField",
+                        "props": {
+                            "model": "trae_ide_version",
+                            "label": "Trae 客户端版本（建议填真实值）",
+                            "placeholder": "如 2.3.76922，留空用内置 3.3.67",
+                            "hint": "填客户端「帮助-关于」里的版本号，或登录态 iCubeLastVersion 的值。"
+                                    "版本和真实设备指纹是服务端领取接口风控的两个关键维度，"
+                                    "旧版本硬编码也是 9074 被拒的原因之一；版本代码自动按去掉点的数字生成"
                         }
                     },
                     {
@@ -966,6 +989,7 @@ class WorkBuddyCheckin(_PluginBase):
             "trae_cron": "",
             "trae_device_id": "",
             "trae_machine_id": "",
+            "trae_ide_version": "",
             "run_once": False,
         }
 
