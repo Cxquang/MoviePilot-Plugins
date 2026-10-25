@@ -44,7 +44,7 @@ class WorkBuddyCheckin(_PluginBase):
     # 插件元数据
     plugin_name = "WorkBuddyCheckin"
     plugin_desc = "WorkBuddy 与 Trae 每日自动签到：自动领取积分，支持设置页保存后立即执行一次、定时签到、远程触发、消息通知策略。"
-    plugin_version = "1.6.1"
+    plugin_version = "1.7.0"
     plugin_author = "Cxquang"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/autosignin.png"
     plugin_order = 100
@@ -599,6 +599,115 @@ class WorkBuddyCheckin(_PluginBase):
             raise TokenInvalidError(f"HTTP {resp.status_code} {data.get('message', '')}".strip())
         return data
 
+    def _trae_get_usage(self, access_token: str) -> dict:
+        """查询 Trae 积分总览（总额/已消耗/积分包到期），失败不影响签到"""
+        logger.info("WorkBuddyCheckin: 请求 Trae 积分总览接口 .../pay/ide_user_ent_usage")
+        try:
+            resp = self._session.post(
+                f"{self._trae_host}/trae/api/v2/pay/ide_user_ent_usage",
+                headers=self._trae_headers(access_token),
+                json={"require_usage": True, "req_source": 1},
+                timeout=(5, 20)
+            )
+        except Exception as e:
+            logger.warning(f"WorkBuddyCheckin: Trae 积分总览请求失败: {e}")
+            return {}
+        try:
+            data = resp.json()
+        except ValueError:
+            data = {}
+        if resp.status_code != 200 or not isinstance(data, dict):
+            logger.warning(f"WorkBuddyCheckin: Trae 积分总览接口返回 HTTP {resp.status_code}")
+            return {}
+        logger.info("WorkBuddyCheckin: Trae 积分总览接口返回 HTTP 200")
+        return data
+
+    @staticmethod
+    def _trae_fmt_num(value) -> str:
+        """积分数字格式化：整数去掉小数点"""
+        try:
+            num = float(value)
+        except (TypeError, ValueError):
+            return str(value)
+        return str(int(num)) if num == int(num) else f"{num:.2f}"
+
+    @classmethod
+    def _trae_format_usage(cls, usage: dict) -> str:
+        """把积分总览格式化为通知文本：总积分、已消耗、剩余及积分包到期情况"""
+        if not usage:
+            return ""
+        summary = usage.get("usage_summary") or {}
+        lines = []
+        total = summary.get("total_amount")
+        consumed = summary.get("consumed_amount")
+        if total is not None:
+            try:
+                remain = max(float(total) - float(consumed or 0), 0)
+            except (TypeError, ValueError):
+                remain = None
+            ratio = summary.get("consumption_ratio")
+            pct = ""
+            if ratio:
+                try:
+                    pct = f"（{float(ratio) * 100:.1f}%）"
+                except (TypeError, ValueError):
+                    pct = ""
+            tail = f" | 剩余约 {cls._trae_fmt_num(remain)}" if remain is not None else ""
+            lines.append(
+                f"总积分 {cls._trae_fmt_num(total)} | 已消耗 "
+                f"{cls._trae_fmt_num(consumed or 0)}{pct}{tail}"
+            )
+
+        now = time.time()
+        packs = []
+        expired = []
+        pack_total = 0.0
+        for pack in usage.get("user_entitlement_pack_list") or []:
+            base = pack.get("entitlement_base_info") or {}
+            limit = (base.get("quota") or {}).get("credits_limit")
+            if not isinstance(limit, (int, float)) or limit <= 0:
+                continue
+            try:
+                used = float((pack.get("usage") or {}).get("credits_amount") or 0)
+            except (TypeError, ValueError):
+                used = 0.0
+            remain_pack = max(float(limit) - used, 0)
+            if remain_pack <= 0:
+                continue
+            name = pack.get("display_desc") or "积分包"
+            expire = pack.get("expire_time") or base.get("end_time")
+            expire_ts = float("inf")
+            if expire:
+                try:
+                    expire_ts = float(expire)
+                    days = int((expire_ts - now) // 86400)
+                    day_text = datetime.fromtimestamp(expire_ts).strftime("%Y-%m-%d")
+                    if days < 0:
+                        expired.append(
+                            f"{name} 剩 {cls._trae_fmt_num(remain_pack)} 分，已于 {day_text} 过期")
+                        continue
+                    if days == 0:
+                        desc = (f"{name} 剩 {cls._trae_fmt_num(remain_pack)} 分，"
+                                f"{day_text} 到期（不足 1 天）")
+                    else:
+                        desc = (f"{name} 剩 {cls._trae_fmt_num(remain_pack)} 分，"
+                                f"{day_text} 到期（{days} 天）")
+                except (TypeError, ValueError, OSError):
+                    desc = f"{name} 剩 {cls._trae_fmt_num(remain_pack)} 分"
+            else:
+                desc = f"{name} 剩 {cls._trae_fmt_num(remain_pack)} 分"
+            pack_total += remain_pack
+            packs.append((expire_ts, desc))
+
+        if packs:
+            lines.append(f"积分包合计剩余 {cls._trae_fmt_num(pack_total)} 分：")
+            packs.sort(key=lambda item: item[0])
+            lines.extend(f"· {desc}" for _, desc in packs)
+        if expired:
+            lines.append("已过期未用：")
+            lines.extend(f"· {desc}" for desc in expired)
+        return "\n".join(lines)
+
     def _trae_claim(self, access_token: str) -> dict:
         """调用 Trae 领取签到积分接口，对 9074 高峰限流做带抖动的退避重试"""
         attempts = 4
@@ -659,10 +768,18 @@ class WorkBuddyCheckin(_PluginBase):
             extra = status.get("extra_credits")
             summary = f"基础 {credits} 分" + (f" | 额外 {extra} 分" if extra is not None else "")
 
+            # 顺带查询积分总览（总额/已消耗/各积分包到期），失败不影响签到结果
+            usage_text = ""
+            try:
+                usage_text = self._trae_format_usage(self._trae_get_usage(token))
+            except Exception as e:
+                logger.warning(f"WorkBuddyCheckin: Trae 积分总览解析失败: {e}")
+            usage_block = f"\n\n【积分总览】\n{usage_text}" if usage_text else ""
+
             if status.get("checked_in"):
                 return self._finish(
                     "already", "Trae今日已签到",
-                    f"今天已签到（重复签到，正常）\n{summary}", prefix="trae")
+                    f"今天已签到（重复签到，正常）\n{summary}{usage_block}", prefix="trae")
 
             claim = self._trae_claim(token)
             ccode = claim.get("code", -1)
@@ -678,7 +795,7 @@ class WorkBuddyCheckin(_PluginBase):
                 gain_text = f" +{gained} 积分" if gained not in (None, "") else ""
                 return self._finish(
                     "success", "Trae签到成功",
-                    f"签到成功{gain_text}\n{summary}", prefix="trae")
+                    f"签到成功{gain_text}\n{summary}{usage_block}", prefix="trae")
 
             if ccode == 9074:
                 return self._finish(
