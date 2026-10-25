@@ -44,7 +44,7 @@ class WorkBuddyCheckin(_PluginBase):
     # 插件元数据
     plugin_name = "WorkBuddyCheckin"
     plugin_desc = "WorkBuddy 与 Trae 每日自动签到：自动领取积分，支持设置页保存后立即执行一次、定时签到、远程触发、消息通知策略。"
-    plugin_version = "1.6.0"
+    plugin_version = "1.6.1"
     plugin_author = "Cxquang"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/autosignin.png"
     plugin_order = 100
@@ -100,8 +100,6 @@ class WorkBuddyCheckin(_PluginBase):
         self._trae_ide_version = (config.get("trae_ide_version") or "").strip() or TRAE_IDE_VERSION
         self._trae_ide_version_code = self._trae_ide_version.replace(".", "") \
             if self._trae_ide_version != TRAE_IDE_VERSION else TRAE_IDE_VERSION_CODE
-        # Trae 独立签到时间：留空则与 WorkBuddy 共用主签到时间
-        self._trae_cron = (config.get("trae_cron") or "").strip() or self._cron
         self._session = requests.Session()
 
         if self._enabled and not self._refresh_token:
@@ -251,31 +249,22 @@ class WorkBuddyCheckin(_PluginBase):
             return {"success": False, "message": str(e)}
 
     def get_service(self) -> List[dict]:
-        """注册定时服务（WorkBuddy 与 Trae 可分别设置签到时间）"""
-        services = []
-        if self._enabled and self._refresh_token:
-            try:
-                services.append({
-                    "id": "WorkBuddyCheckin",
-                    "name": "WorkBuddy 每日签到",
-                    "trigger": CronTrigger.from_crontab(self._cron),
-                    "func": self._scheduled_wb_checkin,
-                    "kwargs": {}
-                })
-            except Exception as e:
-                logger.error(f"WorkBuddyCheckin: WorkBuddy cron 表达式不正确({self._cron}): {e}")
-        if self._trae_enabled and (self._trae_access_token or self._trae_refresh_token):
-            try:
-                services.append({
-                    "id": "WorkBuddyCheckinTrae",
-                    "name": "Trae 每日签到",
-                    "trigger": CronTrigger.from_crontab(self._trae_cron),
-                    "func": self._scheduled_trae_checkin,
-                    "kwargs": {}
-                })
-            except Exception as e:
-                logger.error(f"WorkBuddyCheckin: Trae cron 表达式不正确({self._trae_cron}): {e}")
-        return services
+        """注册定时服务（WorkBuddy 与 Trae 共用同一个签到时间）"""
+        has_wb = self._enabled and self._refresh_token
+        has_trae = self._trae_enabled and (self._trae_access_token or self._trae_refresh_token)
+        if not has_wb and not has_trae:
+            return []
+        try:
+            return [{
+                "id": "WorkBuddyCheckin",
+                "name": "WorkBuddy/Trae 每日签到",
+                "trigger": CronTrigger.from_crontab(self._cron),
+                "func": self._scheduled_checkin,
+                "kwargs": {}
+            }]
+        except Exception as e:
+            logger.error(f"WorkBuddyCheckin: cron 表达式不正确({self._cron}): {e}")
+            return []
 
     def _run_with_timeout(self, label: str, func, timeout: int, prefix: str) -> dict:
         """独立线程执行单个签到任务：超时直接返回失败结果，避免整体流程与通知被卡死
@@ -352,27 +341,12 @@ class WorkBuddyCheckin(_PluginBase):
             logger.error(f"WorkBuddyCheckin: 手动执行签到异常: {e}")
         logger.info("WorkBuddyCheckin: ===== 手动执行一次签到结束 =====")
 
-    def _scheduled_wb_checkin(self):
-        """定时任务：WorkBuddy 签到（独立时间、独立通知）"""
-        logger.info("WorkBuddyCheckin: 定时任务开始（WorkBuddy）")
-        result = self._run_with_timeout("WorkBuddy", self._do_checkin, 300, "checkin")
-        logger.info(
-            f"WorkBuddyCheckin: WorkBuddy 签到结果 -> {result.get('status')} | "
-            f"{(result.get('text') or '').splitlines()[0] if result.get('text') else ''}"
-        )
-        self._notify_results([result])
-        logger.info("WorkBuddyCheckin: 定时任务结束（WorkBuddy）")
-
-    def _scheduled_trae_checkin(self):
-        """定时任务：Trae 签到（可单独错峰，独立通知）"""
-        logger.info(f"WorkBuddyCheckin: 定时任务开始（Trae，cron={self._trae_cron}）")
-        result = self._run_with_timeout("Trae", self._trae_do_checkin, 600, "trae")
-        logger.info(
-            f"WorkBuddyCheckin: Trae 签到结果 -> {result.get('status')} | "
-            f"{(result.get('text') or '').splitlines()[0] if result.get('text') else ''}"
-        )
-        self._notify_results([result])
-        logger.info("WorkBuddyCheckin: 定时任务结束（Trae）")
+    def _scheduled_checkin(self):
+        """定时签到任务：WorkBuddy 与 Trae 依次签到，合并为一条通知"""
+        logger.info(f"WorkBuddyCheckin: 定时签到任务开始（cron={self._cron}）")
+        results = self._collect_checkin_results()
+        self._notify_results(results)
+        logger.info("WorkBuddyCheckin: 定时签到任务结束")
 
     # ==================== 签到核心逻辑 ====================
 
@@ -828,9 +802,9 @@ class WorkBuddyCheckin(_PluginBase):
                         "component": "VTextField",
                         "props": {
                             "model": "cron",
-                            "label": "WorkBuddy 签到时间（Cron）",
+                            "label": "签到时间（Cron）",
                             "placeholder": "0 8 * * *（每天8点）",
-                            "hint": "标准 Cron 表达式：分 时 日 月 周；仅影响 WorkBuddy"
+                            "hint": "标准 Cron 表达式：分 时 日 月 周；WorkBuddy 与 Trae 在该时间一起签到"
                         }
                     },
                     {
@@ -872,7 +846,8 @@ class WorkBuddyCheckin(_PluginBase):
                             "class": "mt-2 mb-1",
                             "text": "Trae 签到（api.trae.cn）：建议直接填 Access Token，"
                                     "绕过 refreshToken 换 token 步骤（不同客户端版本的 ClientID 可能不同）；"
-                                    "与 WorkBuddy 共用上面的签到时间、通知策略与消息类型"
+                                    "与 WorkBuddy 共用上面的签到时间、通知策略与消息类型，"
+                                    "两者签到完成后合并为一条通知"
                         }
                     },
                     {
@@ -921,16 +896,6 @@ class WorkBuddyCheckin(_PluginBase):
                             "placeholder": "留空用默认 ono9krqynydwx5",
                             "hint": "用于 refreshToken 换 accessToken，不同客户端版本可能不同；"
                                     "报 400 refresh token 与 ClientID 不匹配时，从 Trae 客户端抓包确认后填入"
-                        }
-                    },
-                    {
-                        "component": "VTextField",
-                        "props": {
-                            "model": "trae_cron",
-                            "label": "Trae 签到时间（Cron，可选）",
-                            "placeholder": "留空与 WorkBuddy 相同；建议错峰，如 5 0 * * *",
-                            "hint": "Trae 领取接口有高峰限流（9074「当前参与用户太多」），"
-                                    "把 Trae 单独放到凌晨低峰更容易成功，且不影响 WorkBuddy 的签到时间"
                         }
                     },
                     {
@@ -1014,7 +979,6 @@ class WorkBuddyCheckin(_PluginBase):
             "trae_uid": "",
             "trae_host": "https://api.trae.cn",
             "trae_client_id": "",
-            "trae_cron": "",
             "trae_device_id": "",
             "trae_machine_id": "",
             "trae_ide_version": "",
