@@ -243,11 +243,11 @@ class BotHostingRenew(_PluginBase):
     # 插件名称
     plugin_name = "Bot-Hosting自动续期"
     # 插件描述
-    plugin_desc = "Bot-Hosting.net 免费套餐自动续期（4天一期）：可选先插件浏览器续期、失败转 Action / 直接走 Action / 仅插件续期，token 优先、账号密码兜底登录"
+    plugin_desc = "Bot-Hosting.net 免费套餐自动续期（4天一期）：可选先插件浏览器续期、失败转 Action / 直接走 Action / 仅插件续期，token 优先、账号密码兜底登录；可选 SeleniumBase uc 模式绕过 Cloudflare"
     # 插件图标
     plugin_icon = "https://bot-hosting.net/favicon.ico"
     # 插件版本
-    plugin_version = "1.3.14"
+    plugin_version = "1.3.15"
     # 插件作者
     plugin_author = "Cxquang"
     # 作者主页
@@ -275,6 +275,7 @@ class BotHostingRenew(_PluginBase):
     _gh_workflow = "renew.yml"
     _gh_ref = "main"
     _onlyonce = False
+    _use_seleniumbase = False
     # 运行状态
     _last_result = None
     _xvfb_active = False
@@ -296,6 +297,7 @@ class BotHostingRenew(_PluginBase):
             self._gh_workflow = (config.get("gh_workflow") or "renew.yml").strip()
             self._gh_ref = (config.get("gh_ref") or "main").strip()
             self._onlyonce = config.get("onlyonce") or False
+            self._use_seleniumbase = config.get("use_seleniumbase") or False
             # 立即执行一次：开启并保存后触发，执行完自动关闭
             if self._onlyonce:
                 self._onlyonce = False
@@ -324,6 +326,7 @@ class BotHostingRenew(_PluginBase):
             "gh_workflow": self._gh_workflow,
             "gh_ref": self._gh_ref,
             "onlyonce": onlyonce,
+            "use_seleniumbase": self._use_seleniumbase,
         })
 
     def get_state(self) -> bool:
@@ -756,13 +759,21 @@ class BotHostingRenew(_PluginBase):
     def __do_renew(self, session_token: str) -> dict:
         """浏览器续期入口
 
-        MoviePilot 的 /run 接口运行在 asyncio 事件循环线程里，而 Playwright
+        MoviePilot 的 /run 接口运行在 asyncio 事件循环线程里，而浏览器
         同步 API 禁止在事件循环线程中使用，因此单独开线程执行再等结果。
+        若开启 SeleniumBase 且已安装，优先使用其对 Cloudflare 更强的绕过能力。
         """
         outcome: Dict[str, Any] = {}
 
         def _worker():
             try:
+                if self._use_seleniumbase:
+                    sb_res = self.__sb_renew(session_token)
+                    if sb_res.get("fallback"):
+                        logger.info(f"[BotHosting] SeleniumBase 不可用（{sb_res.get('error')}），回退到 Playwright")
+                    else:
+                        outcome.update(sb_res)
+                        return
                 outcome.update(self.__browser_renew(session_token))
             except Exception as e:
                 logger.error(f"[BotHosting] 浏览器续期异常: {e}\n{traceback.format_exc()}")
@@ -776,6 +787,315 @@ class BotHostingRenew(_PluginBase):
                     "error": f"浏览器续期超时（{BROWSER_TOTAL_TIMEOUT}s），"
                              "多半是容器网络无法访问 challenges.cloudflare.com，或被 Cloudflare 风控"}
         return outcome or {"ok": False, "error": "浏览器续期未返回结果"}
+
+    # ---------------------- SeleniumBase 模式（对齐 eooce 参考实现） ----------------------
+
+    def __sb_renew(self, session_token: str) -> dict:
+        """使用 SeleniumBase (uc=True) 执行续期，对 Cloudflare 绕过能力更强。
+
+        需要容器内提前安装：pip install seleniumbase，并执行 seleniumbase install chromedriver
+        未安装时返回特定错误，外层自动回退到 Playwright。
+        """
+        try:
+            from seleniumbase import SB
+        except ImportError:
+            return {"ok": False, "fallback": True,
+                    "error": "未安装 seleniumbase（pip install seleniumbase）"}
+
+        logs: List[str] = []
+
+        def log(msg: str):
+            logger.info(f"[BotHosting][SB] {msg}")
+            logs.append(msg)
+
+        if not (self._email and self._password):
+            # 只有 session_token 时无法走账密登录，交给 Playwright 注入 Cookie
+            return {"ok": False, "fallback": True,
+                    "error": "SeleniumBase 模式需要邮箱+密码，当前未填写"}
+
+        ts_token_js = """
+        try { if (window.turnstile && window.turnstile.getResponse) {
+                var t = window.turnstile.getResponse(); if (t) return t; } } catch (e) {}
+        var el = document.querySelector('input[name="cf-turnstile-response"]');
+        return el ? (el.value || '') : '';
+        """
+        ts_exists_js = """
+        return document.querySelector(
+            'input[name="cf-turnstile-response"], iframe[src*="challenges.cloudflare.com"], .cf-turnstile'
+        ) !== null;
+        """
+        ts_coords_js = """
+        function findWidget(root) {
+            var els = root.querySelectorAll('iframe[src*="challenges.cloudflare.com"], .cf-turnstile, [id*="cf-chl"], [class*="turnstile"]');
+            for (var i = 0; i < els.length; i++) {
+                var r = els[i].getBoundingClientRect();
+                if (r.width > 50 && r.height > 20) return els[i];
+            }
+            var all = root.querySelectorAll('*');
+            for (var j = 0; j < all.length; j++) {
+                if (all[j].shadowRoot) {
+                    var f = findWidget(all[j].shadowRoot);
+                    if (f) return f;
+                }
+            }
+            return null;
+        }
+        function boxFromTokenInput() {
+            var el = document.querySelector('input[name="cf-turnstile-response"]');
+            var cur = el ? el.parentElement : null;
+            for (var k = 0; k < 8 && cur; k++) {
+                var r = cur.getBoundingClientRect();
+                if (r.width > 100 && r.width < 600 && r.height > 30 && r.height < 160) return cur;
+                cur = cur.parentElement;
+            }
+            return null;
+        }
+        var hit = findWidget(document) || boxFromTokenInput();
+        if (!hit) return null;
+        var hr = hit.getBoundingClientRect();
+        return {cx: Math.round(hr.x + 30), cy: Math.round(hr.y + hr.height / 2)};
+        """
+
+        def sb_js(sb, script, default=None):
+            try:
+                r = sb.execute_script(script)
+                return default if r is None else r
+            except Exception:
+                return default
+
+        def sb_token(sb):
+            r = sb_js(sb, ts_token_js, "")
+            return r if isinstance(r, str) else ""
+
+        def sb_click_turnstile(sb):
+            # 1) xdotool 底层点击（需要对 Xvfb 上的窗口发真实 X11 事件）
+            coords = sb_js(sb, ts_coords_js, None)
+            if coords and shutil.which("xdotool"):
+                try:
+                    cx, cy = int(coords["cx"]), int(coords["cy"])
+                    win = sb_js(
+                        sb,
+                        "return '' + (window.screenX || 0) + '|' + (window.screenY || 0)"
+                        " + '|' + window.outerHeight + '|' + window.innerHeight;",
+                        "",
+                    )
+                    parts = str(win).split("|")
+                    sx = int(parts[0] or 0) if len(parts) > 0 else 0
+                    sy = int(parts[1] or 0) if len(parts) > 1 else 0
+                    oh = int(parts[2] or 900) if len(parts) > 2 else 900
+                    ih = int(parts[3] or 900) if len(parts) > 3 else 900
+                    ax, ay = cx + sx, cy + sy + (oh - ih)
+                    env = {**os.environ, "DISPLAY": XVFB_DISPLAY}
+                    for _cls in ("chrome", "chromium", "Chromium", "Chrome", "google-chrome"):
+                        try:
+                            r = subprocess.run(
+                                ["xdotool", "search", "--onlyvisible", "--class", _cls],
+                                env=env, capture_output=True, text=True, timeout=3)
+                            wids = [w for w in (r.stdout or "").split() if w.strip()]
+                            if wids:
+                                subprocess.run(["xdotool", "windowactivate", "--sync", wids[0]],
+                                               env=env, capture_output=True, timeout=3)
+                                time.sleep(0.2)
+                                break
+                        except Exception:
+                            continue
+                    subprocess.run(["xdotool", "mousemove", "--sync", str(ax), str(ay)],
+                                   env=env, capture_output=True, timeout=3)
+                    time.sleep(0.15)
+                    subprocess.run(["xdotool", "click", "1"], env=env, capture_output=True, timeout=3)
+                    log(f"底层点击 Turnstile ({ax}, {ay})")
+                    return True
+                except Exception as e:
+                    log(f"底层点击失败: {e}")
+            # 2) SeleniumBase 自带 CAPTCHA 点击兜底
+            try:
+                sb.uc_gui_click_captcha()
+                log("调用 sb.uc_gui_click_captcha 兜底")
+                return True
+            except Exception:
+                pass
+            try:
+                if hasattr(sb, "cdp") and hasattr(sb.cdp, "click_captcha"):
+                    sb.cdp.click_captcha()
+                    log("调用 sb.cdp.click_captcha 兜底")
+                    return True
+            except Exception as e:
+                log(f"click_captcha 失败: {e}")
+            return False
+
+        def sb_wait_turnstile(sb, timeout: int = 60, first_wait: int = 8) -> bool:
+            deadline = time.time() + timeout
+            next_click = time.time() + first_wait
+            clicks = 0
+            while time.time() < deadline:
+                if sb_token(sb):
+                    return True
+                if time.time() >= next_click:
+                    clicks += 1
+                    log(f"第 {clicks} 次点击 Turnstile...")
+                    sb_click_turnstile(sb)
+                    next_click = time.time() + 10 + random.uniform(0, 3)
+                time.sleep(2)
+            return bool(sb_token(sb))
+
+        def _norm_expiry(d: str) -> str:
+            """把 2026/10/29 或 10/29/2026 统一成 2026/10/29"""
+            parts = d.split("/")
+            if len(parts) == 3 and len(parts[2]) == 4:
+                return f"{parts[2]}/{int(parts[0]):02d}/{int(parts[1]):02d}"
+            return d
+
+        def sb_extract_expiry(text: str):
+            m = re.search(r"[Ee]xpires\s*[:\-]?\s*(\d{4}/\d{1,2}/\d{1,2}|\d{1,2}/\d{1,2}/\d{4})", text)
+            if m:
+                return _norm_expiry(m.group(1))
+            m = re.search(r"(?:freeRenewalDueAt|expiry|expires)\D{0,20}(\d{4}-\d{2}-\d{2}T[\d:.]+Z)", text, re.I)
+            if m:
+                return m.group(1)
+            return None
+
+        xvfb_proc = None
+        try:
+            env_note = ""
+            if os.name != "nt" and shutil.which("Xvfb"):
+                xvfb_proc, display_env = self.__start_xvfb(log)
+                if display_env:
+                    os.environ["DISPLAY"] = display_env["DISPLAY"]
+                    self._xvfb_active = True
+                    env_note = f"（Xvfb {XVFB_DISPLAY}）"
+                else:
+                    log("Xvfb 不可用，SeleniumBase 将走无头模式")
+
+            headless = not self._xvfb_active
+            log(f"启动 SeleniumBase uc 模式{env_note}（headless={headless}）...")
+            with SB(uc=True, headless=headless, locale_code="en-US") as sb:
+                log(f"访问 {BASE_URL}/login")
+                sb.open(f"{BASE_URL}/login")
+                sb.wait_for_ready_state_complete()
+                sb.sleep(3)
+                try:
+                    sb.click('button[type="submit"]')
+                except Exception:
+                    pass
+                sb.sleep(12)
+
+                try:
+                    if self._email:
+                        sb.type('input[type="email"]', self._email)
+                        sb.sleep(1)
+                    if self._password:
+                        sb.type('input[type="password"]', self._password)
+                        sb.sleep(3)
+                except Exception as e:
+                    return {"ok": False, "error": f"SeleniumBase 填写登录表单失败: {e}", "logs": logs[-10:]}
+
+                if sb_js(sb, ts_exists_js, False):
+                    if not sb_wait_turnstile(sb):
+                        log("登录页 Turnstile 未通过，仍尝试提交")
+                sb.sleep(1)
+                try:
+                    sb.click('button[type="submit"]')
+                except Exception:
+                    pass
+                log("提交登录")
+                sb.sleep(6)
+                sb.wait_for_ready_state_complete()
+
+                cur_url = sb.get_current_url()
+                log(f"登录后 URL: {cur_url}")
+                if "/login" in cur_url:
+                    return {"ok": False, "error": "SeleniumBase 登录后仍停留在登录页", "logs": logs[-10:]}
+
+                sb.open(f"{BASE_URL}/a/billings")
+                sb.wait_for_ready_state_complete()
+                sb.sleep(3)
+
+                try:
+                    page_text = sb.get_page_source()
+                except Exception:
+                    page_text = ""
+                current_expiry = sb_extract_expiry(page_text)
+                if current_expiry:
+                    log(f"当前到期日期: {current_expiry}")
+
+                outer_selector = None
+                countdown_text = None
+                for selector in ('button:contains("Renew free plan")', 'button:contains("Renew")',
+                                 'a:contains("Renew")', '[class*="renew"]', '[class*="Renew"]'):
+                    try:
+                        if sb.is_element_visible(selector):
+                            text = sb.get_text(selector)
+                            m = re.search(r"(?:Renew in|Renewal cooldown)\s+(\d{1,2}:\d{2}:\d{2})", text, re.I)
+                            if m:
+                                countdown_text = m.group(1)
+                                log(f"续期冷却中: {text}")
+                                break
+                            elif "Renew" in text:
+                                outer_selector = selector
+                                log(f"续期按钮可用: {text}")
+                                break
+                    except Exception:
+                        continue
+
+                if countdown_text:
+                    return {"ok": False, "expiry": current_expiry,
+                            "error": f"无需续期（冷却中），倒计时: {countdown_text}", "logs": logs[-10:]}
+                if not outer_selector:
+                    return {"ok": False, "expiry": current_expiry,
+                            "error": "未找到可用的续期按钮", "logs": logs[-10:]}
+
+                sb.sleep(2)
+                sb.click(outer_selector)
+                log("点击外部续期按钮，等待弹窗...")
+                sb.sleep(15)
+
+                turnstile_passed = True
+                if sb_js(sb, ts_exists_js, False):
+                    turnstile_passed = sb_wait_turnstile(sb)
+                    if not turnstile_passed:
+                        sb_click_turnstile(sb)
+                        sb.sleep(4)
+                        turnstile_passed = sb_token(sb) != ""
+
+                if not turnstile_passed:
+                    return {"ok": False, "expiry": current_expiry,
+                            "error": "弹窗 Turnstile 验证未通过（cf-turnstile-response 一直为空）",
+                            "logs": logs[-10:]}
+
+                sb.sleep(5)
+                try:
+                    sb.click('div[role="dialog"] button.btn-primary', timeout=8)
+                    log("已点击弹窗确认按钮")
+                except Exception:
+                    try:
+                        sb.click('#renew-dialog button.btn-primary', timeout=8)
+                        log("已点击弹窗确认按钮（#renew-dialog）")
+                    except Exception as e:
+                        return {"ok": False, "expiry": current_expiry,
+                                "error": f"点击弹窗确认按钮失败: {e}", "logs": logs[-10:]}
+
+                sb.sleep(6)
+                try:
+                    new_text = sb.get_page_source()
+                except Exception:
+                    new_text = ""
+                new_expiry = sb_extract_expiry(new_text)
+                new_countdown = re.search(r"(?:Renewal cooldown|Renew in)\s+(\d{1,2}:\d{2}:\d{2})",
+                                          new_text, re.I)
+                if new_countdown:
+                    return {"ok": True, "expiry": new_expiry or current_expiry, "logs": logs[-10:]}
+                if new_expiry and current_expiry and new_expiry != current_expiry:
+                    return {"ok": True, "expiry": new_expiry, "logs": logs[-10:]}
+                return {"ok": False, "expiry": new_expiry or current_expiry,
+                        "error": "续期结果未知，到期时间未变化", "logs": logs[-10:]}
+
+        except Exception as e:
+            logger.error(f"[BotHosting][SB] 续期异常: {e}\n{traceback.format_exc()}")
+            return {"ok": False, "error": f"SeleniumBase 续期异常: {e}", "logs": logs[-10:]}
+        finally:
+            self._xvfb_active = False
+            self.__stop_xvfb(xvfb_proc)
+
 
     def __browser_renew(self, session_token: str) -> dict:
         """Playwright 模拟真人：打开账单页 -> 点续期 -> 过 Turnstile -> 点确认"""
@@ -1160,71 +1480,82 @@ class BotHostingRenew(_PluginBase):
         if shutil.which("Xvfb"):
             # 有头模式：启动虚拟显示，浏览器窗口渲染在 Xvfb 里，
             # 指纹更接近真实用户，Cloudflare 更愿意出 token
-            try:
-                # 1. 清理残留的 Xvfb lock/socket 文件（上次 run 异常退出会留）
-                lock = f"/tmp/.X{XVFB_DISPLAY[1:]}-lock"
-                socket_dir = "/tmp/.X11-unix"
-                socket_path = f"{socket_dir}/X{XVFB_DISPLAY[1:]}"
-                for stale in (lock, socket_path):
-                    if os.path.exists(stale):
-                        try:
-                            os.remove(stale)
-                            log(f"清理残留 Xvfb 文件: {stale}")
-                        except Exception:
-                            pass
-
-                # 2. 启动 Xvfb（stderr 保留，便于诊断）
-                xvfb_proc = subprocess.Popen(
-                    ["Xvfb", XVFB_DISPLAY, "-screen", "0", "1366x900x24",
-                     "-nolisten", "tcp"],
-                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-                )
-                # 3. 等待并确认 Xvfb 真起来了（检查 socket 文件）
-                display_ready = False
-                for _ in range(15):
-                    time.sleep(0.3)
-                    if xvfb_proc.poll() is not None:
-                        # Xvfb 自己崩了，读 stderr
-                        stderr_data = ""
-                        try:
-                            stderr_data = xvfb_proc.stderr.read().decode(errors="replace")
-                        except Exception:
-                            pass
-                        log(f"Xvfb 启动后立即退出（exit={xvfb_proc.returncode}）: {stderr_data[:300]}")
-                        xvfb_proc = None
-                        break
-                    if os.path.exists(socket_path):
-                        display_ready = True
-                        break
-                if not display_ready:
-                    log(f"Xvfb 启动超时（socket {socket_path} 未出现），回退无头")
-                    if xvfb_proc:
-                        try:
-                            xvfb_proc.kill()
-                        except Exception:
-                            pass
-                    xvfb_proc = None
-                else:
-                    launch_kwargs["env"] = {**os.environ, "DISPLAY": XVFB_DISPLAY}
+            xvfb_proc, display_env = self.__start_xvfb(log)
+            if display_env:
+                try:
+                    launch_kwargs["env"] = display_env
                     launch_kwargs["headless"] = False
                     browser = self.__launch_retry(p, launch_kwargs, log)
                     self._xvfb_active = True
                     log(f"有头模式启动成功（Xvfb {XVFB_DISPLAY}，socket 已就绪）")
                     return browser, xvfb_proc
-            except Exception as e:
-                log(f"有头模式启动失败，回退无头: {e}")
-                if xvfb_proc:
-                    try:
-                        xvfb_proc.kill()
-                    except Exception:
-                        pass
-                xvfb_proc = None
+                except Exception as e:
+                    log(f"有头模式启动失败，回退无头: {e}")
+                    self.__stop_xvfb(xvfb_proc)
+                    xvfb_proc = None
 
         self._xvfb_active = False
         launch_kwargs["headless"] = True
         browser = self.__launch_retry(p, launch_kwargs, log)
         log("无头模式启动成功（Cloudflare 可能拒发 token，请尽量保证有头模式）")
         return browser, None
+
+    def __start_xvfb(self, log) -> tuple:
+        """启动 Xvfb 虚拟显示，返回 (xvfb_proc, env)；失败返回 (None, None)"""
+        xvfb_proc = None
+        try:
+            # 1. 清理残留的 Xvfb lock/socket 文件（上次 run 异常退出会留）
+            lock = f"/tmp/.X{XVFB_DISPLAY[1:]}-lock"
+            socket_dir = "/tmp/.X11-unix"
+            socket_path = f"{socket_dir}/X{XVFB_DISPLAY[1:]}"
+            for stale in (lock, socket_path):
+                if os.path.exists(stale):
+                    try:
+                        os.remove(stale)
+                        log(f"清理残留 Xvfb 文件: {stale}")
+                    except Exception:
+                        pass
+
+            # 2. 启动 Xvfb（stderr 保留，便于诊断）
+            xvfb_proc = subprocess.Popen(
+                ["Xvfb", XVFB_DISPLAY, "-screen", "0", "1366x900x24",
+                 "-nolisten", "tcp"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+            )
+            # 3. 等待并确认 Xvfb 真起来了（检查 socket 文件）
+            display_ready = False
+            for _ in range(15):
+                time.sleep(0.3)
+                if xvfb_proc.poll() is not None:
+                    stderr_data = ""
+                    try:
+                        stderr_data = xvfb_proc.stderr.read().decode(errors="replace")
+                    except Exception:
+                        pass
+                    log(f"Xvfb 启动后立即退出（exit={xvfb_proc.returncode}）: {stderr_data[:300]}")
+                    xvfb_proc = None
+                    break
+                if os.path.exists(socket_path):
+                    display_ready = True
+                    break
+            if not display_ready:
+                log(f"Xvfb 启动超时（socket {socket_path} 未出现），回退无头")
+                self.__stop_xvfb(xvfb_proc)
+                return None, None
+            return xvfb_proc, {**os.environ, "DISPLAY": XVFB_DISPLAY}
+        except Exception as e:
+            log(f"启动 Xvfb 失败: {e}")
+            self.__stop_xvfb(xvfb_proc)
+            return None, None
+
+    @staticmethod
+    def __stop_xvfb(xvfb_proc):
+        if not xvfb_proc:
+            return
+        try:
+            xvfb_proc.kill()
+        except Exception:
+            pass
 
     def __launch_retry(self, p, launch_kwargs: dict, log):
         """启动 Chromium，未安装时自动下载二进制"""
@@ -2147,6 +2478,18 @@ class BotHostingRenew(_PluginBase):
                                     },
                                 }]
                             },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [{
+                                    "component": "VSwitch",
+                                    "props": {
+                                        "model": "use_seleniumbase",
+                                        "label": "使用 SeleniumBase（需 pip install seleniumbase）",
+                                        "placeholder": "uc 模式对 Cloudflare 绕过更强；未安装时自动回退 Playwright",
+                                    },
+                                }]
+                            },
                         ]
                     },
                     # 续期方式
@@ -2309,6 +2652,8 @@ class BotHostingRenew(_PluginBase):
                                         "GitHub PAT 需 Actions 读写权限（细粒度：Actions Read and write；经典：repo + workflow）。"
                                         "首次运行会自动下载 Chromium（约 150MB），保存在 /config/.playwright。"
                                         "容器必须能访问 bot-hosting.net、challenges.cloudflare.com 和 api.github.com。"
+                                        "若 Playwright 仍被 Cloudflare 拦截，可在容器内 pip install seleniumbase 并执行 "
+                                        "seleniumbase install chromedriver，再开启「使用 SeleniumBase」，走 uc 模式（需填邮箱+密码）。"
                                         "修改配置后可开启「立即执行一次」验证，结果按通知策略推送。",
                                     },
                                 }]
@@ -2333,6 +2678,7 @@ class BotHostingRenew(_PluginBase):
             "gh_workflow": "renew.yml",
             "gh_ref": "main",
             "onlyonce": False,
+            "use_seleniumbase": False,
         }
 
     def get_page(self) -> List[dict]:
