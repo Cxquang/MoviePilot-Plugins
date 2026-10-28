@@ -247,7 +247,7 @@ class BotHostingRenew(_PluginBase):
     # 插件图标
     plugin_icon = "https://bot-hosting.net/favicon.ico"
     # 插件版本
-    plugin_version = "1.3.15"
+    plugin_version = "1.3.16"
     # 插件作者
     plugin_author = "Cxquang"
     # 作者主页
@@ -576,11 +576,62 @@ class BotHostingRenew(_PluginBase):
         # 5. 浏览器模拟续期（账号密码优先，其次 session_token）
         renew_res = self.__do_renew(session_token)
         if renew_res.get("ok"):
-            ok, msg, new_expiry = self.__verify_renewal(old_expiry)
+            browser_name = "SeleniumBase uc 模式" if self._use_seleniumbase else "Playwright"
+            if renew_res.get("confirmed") is None:
+                # Playwright 流程未自带确认结果，交给统一核对
+                ok, msg, new_expiry = self.__verify_renewal(old_expiry)
+                return {
+                    "success": ok,
+                    "title": "续期成功 +4 天" if ok else "续期已提交（待确认）",
+                    "warn": not ok,
+                    "detail": f"续期方式：浏览器模拟点击（{browser_name}，{login_method}）\n{msg}",
+                    "expiry": new_expiry or expiry,
+                    "login_method": login_method,
+                    "time": self.__now_str(),
+                }
+
+            # SeleniumBase 已在同一浏览器会话内完成确认
+            confirmed = bool(renew_res.get("confirmed"))
+            new_expiry = renew_res.get("expiry") or old_expiry
+            msg = renew_res.get("detail") or ""
+
+            # 未确认时补一次快速 HTTP 核对（不启动浏览器，避免又等几分钟）
+            if not confirmed and self._session_token:
+                try:
+                    http_exp = self.__query_status(self._session_token).get("expiry")
+                except Exception:
+                    http_exp = None
+                if http_exp:
+                    old_dt = self.__parse_time(old_expiry) if old_expiry else None
+                    new_dt = self.__parse_time(http_exp)
+                    if old_dt and new_dt and new_dt > old_dt:
+                        confirmed = True
+                        new_expiry = http_exp
+                        msg += f"\nHTTP 核对：到期时间已延后至 {http_exp}"
+                    elif not old_dt and new_dt:
+                        confirmed = True
+                        new_expiry = http_exp
+                        msg += f"\nHTTP 核对：当前到期时间 {http_exp}"
+                    else:
+                        new_expiry = new_expiry or http_exp
+
+            if confirmed:
+                return {
+                    "success": True,
+                    "title": "续期成功 +4 天",
+                    "detail": f"续期方式：浏览器模拟点击（{browser_name}，{login_method}）\n{msg}",
+                    "expiry": new_expiry or expiry,
+                    "login_method": login_method,
+                    "time": self.__now_str(),
+                }
+
             return {
-                "success": ok,
-                "title": "续期成功 +4 天" if ok else "续期已提交，但未确认到账",
-                "detail": f"续期方式：浏览器模拟点击（Playwright，{login_method}）\n{msg}",
+                "success": True,
+                "warn": True,
+                "title": "续期已提交（待确认）",
+                "detail": (f"续期方式：浏览器模拟点击（{browser_name}，{login_method}）\n"
+                           f"{msg}\n"
+                           "请打开账单页确认新的到期时间：https://bot-hosting.net/a/billings"),
                 "expiry": new_expiry or expiry,
                 "login_method": login_method,
                 "time": self.__now_str(),
@@ -954,6 +1005,58 @@ class BotHostingRenew(_PluginBase):
                 return m.group(1)
             return None
 
+        def sb_save_session(sb):
+            """把登录后拿到的 session_token 写回配置，后续 HTTP 查询可直接复用"""
+            try:
+                for c in sb.get_cookies():
+                    if (c.get("name") or "") == "session_token" and c.get("value"):
+                        if c["value"] != self._session_token:
+                            self._session_token = c["value"]
+                            self.__save_config()
+                            log("session_token 已自动更新（后续 HTTP 查询可直接使用）")
+                        return
+            except Exception as e:
+                logger.debug(f"[BotHosting][SB] 读取 cookie 失败: {e}")
+
+        def sb_confirm_renew(sb, old_expiry_value: Optional[str]) -> tuple:
+            """点击确认后反复刷新账单页，确认到期时间延后或出现续期冷却倒计时"""
+            deadline = time.time() + 50
+            last_expiry = None
+            last_cooldown = ""
+            cd_pattern = re.compile(
+                r"(?:Renew in|Renewal cooldown|Available in|Next renew in)\s*([0-9][0-9dhms:\s]{0,24})",
+                re.I)
+            while time.time() < deadline:
+                sb.sleep(4)
+                try:
+                    sb.refresh()
+                    sb.wait_for_ready_state_complete()
+                    sb.sleep(2)
+                except Exception:
+                    pass
+                try:
+                    text = sb.get_page_source() or ""
+                except Exception:
+                    text = ""
+                if not text:
+                    continue
+                parsed = sb_extract_expiry(text)
+                if parsed:
+                    last_expiry = parsed
+                cd = cd_pattern.search(text)
+                if cd:
+                    last_cooldown = cd.group(1).strip()
+                # 冷却倒计时出现 = 续期已生效（账单页会显示下次可续期时间）
+                if last_cooldown:
+                    return True, last_expiry, last_cooldown
+                old_dt = self.__parse_time(old_expiry_value)
+                new_dt = self.__parse_time(last_expiry)
+                if old_dt and new_dt and new_dt > old_dt:
+                    return True, last_expiry, last_cooldown
+                if old_expiry_value and last_expiry and last_expiry != old_expiry_value:
+                    return True, last_expiry, last_cooldown
+            return False, last_expiry, last_cooldown
+
         xvfb_proc = None
         try:
             env_note = ""
@@ -1074,20 +1177,29 @@ class BotHostingRenew(_PluginBase):
                         return {"ok": False, "expiry": current_expiry,
                                 "error": f"点击弹窗确认按钮失败: {e}", "logs": logs[-10:]}
 
-                sb.sleep(6)
-                try:
-                    new_text = sb.get_page_source()
-                except Exception:
-                    new_text = ""
-                new_expiry = sb_extract_expiry(new_text)
-                new_countdown = re.search(r"(?:Renewal cooldown|Renew in)\s+(\d{1,2}:\d{2}:\d{2})",
-                                          new_text, re.I)
-                if new_countdown:
-                    return {"ok": True, "expiry": new_expiry or current_expiry, "logs": logs[-10:]}
-                if new_expiry and current_expiry and new_expiry != current_expiry:
-                    return {"ok": True, "expiry": new_expiry, "logs": logs[-10:]}
-                return {"ok": False, "expiry": new_expiry or current_expiry,
-                        "error": "续期结果未知，到期时间未变化", "logs": logs[-10:]}
+                sb.sleep(4)
+                sb_save_session(sb)
+
+                confirmed, final_expiry, cooldown = sb_confirm_renew(sb, current_expiry)
+                if confirmed:
+                    if final_expiry and current_expiry and final_expiry != current_expiry:
+                        detail = f"到期时间：{current_expiry} → {final_expiry}"
+                    else:
+                        detail = f"当前到期时间：{final_expiry or current_expiry}"
+                    if cooldown:
+                        detail += f"\n续期冷却倒计时：{cooldown}"
+                    log(f"续期已确认（{detail.replace(chr(10), '；')}）")
+                    return {"ok": True, "confirmed": True,
+                            "expiry": final_expiry or current_expiry,
+                            "cooldown": cooldown, "detail": detail,
+                            "logs": logs[-10:]}
+
+                log("已点击确认按钮，但账单页刷新后仍未读到新的到期时间")
+                return {"ok": True, "confirmed": False,
+                        "expiry": final_expiry or current_expiry,
+                        "cooldown": cooldown,
+                        "detail": "已在浏览器中点击弹窗「续期」确认按钮并提交，但账单页刷新后仍未读到新的到期时间。",
+                        "logs": logs[-10:]}
 
         except Exception as e:
             logger.error(f"[BotHosting][SB] 续期异常: {e}\n{traceback.format_exc()}")
@@ -1663,7 +1775,8 @@ class BotHostingRenew(_PluginBase):
 
         t = threading.Thread(target=_worker, daemon=True)
         t.start()
-        t.join(timeout=BROWSER_TOTAL_TIMEOUT)
+        # 核对只给 150 秒：浏览器核对失败不该拖住整轮任务（主流程最长 420 秒）
+        t.join(timeout=min(BROWSER_TOTAL_TIMEOUT, 150))
         return box.get("expiry")
 
     def __browser_expiry_sync(self) -> Optional[str]:
@@ -2298,16 +2411,19 @@ class BotHostingRenew(_PluginBase):
         self._notify_message(result.get("title") or "执行完成",
                              result.get("detail") or "",
                              failure=not result.get("success"),
-                             expiry=result.get("expiry"))
+                             expiry=result.get("expiry"),
+                             warn=bool(result.get("warn")))
 
-    def _notify_message(self, title: str, text: str, failure: bool = False, expiry: str = ""):
+    def _notify_message(self, title: str, text: str, failure: bool = False,
+                        expiry: str = "", warn: bool = False):
         """拼接通知文案并推送（MP 消息渠道，含企业微信），并按通知策略过滤"""
         if self._notify == NOTIFY_OFF:
             return
-        if self._notify == NOTIFY_FAILURE and not failure:
+        if self._notify == NOTIFY_FAILURE and not failure and not warn:
             return
         lines = ["Bot-Hosting 自动续期通知", ""]
-        lines.append(("❌ " if failure else "✅ ") + title)
+        icon = "❌ " if failure else ("⚠️ " if warn else "✅ ")
+        lines.append(icon + title)
         if self._email:
             lines.append(f"👤 账户: {self.__mask_email(self._email)}")
         if expiry:
