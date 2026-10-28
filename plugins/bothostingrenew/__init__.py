@@ -51,7 +51,6 @@ TURNSTILE_API = "https://challenges.cloudflare.com/turnstile/v0/api.js"
 BROWSERS_PATH = "/config/.playwright"   # 持久化到 config 卷，重建容器不用重复下载
 TURNSTILE_WAIT = 120                    # 等待 Turnstile token 上限（秒）
 BROWSER_TOTAL_TIMEOUT = 420             # 整个浏览器流程上限（秒），含弹窗就绪等待
-GH_ACTION_WAIT_TIMEOUT = 420            # 触发 Action 后等待运行结果上限（秒）
 XVFB_DISPLAY = ":99"                    # 容器内有头模式使用的虚拟显示
 
 # 反自动化检测脚本：Cloudflare Turnstile 会检查 webdriver/headless 指纹
@@ -549,16 +548,10 @@ class BotHostingRenew(_PluginBase):
             logger.info("续期方式为直接走 GitHub Actions，尝试触发")
             ok, gh_err = self.__dispatch_github_action()
             if ok:
-                self._notify_message(
-                    "已直接触发 GitHub Actions 续期",
-                    f"未执行插件浏览器续期（方式：直接走 Action）。\n"
-                    f"已触发 {self._gh_repo} 的 {self._gh_workflow} 执行自动续期。\n"
-                    f"Actions 页面：https://github.com/{self._gh_repo}/actions/workflows/{self._gh_workflow}\n"
-                    "插件到此结束，不再监听；执行结果由 Action 仓库自行推送企业微信通知。",
-                    failure=False, expiry=expiry)
+                # 只触发不通知：结果统一由 Action 仓库推送，避免插件与 Action 各发一条
                 return {
                     "success": True,
-                    "silent": True,  # 已单独发出通知，避免重复推送
+                    "silent": True,
                     "title": "已触发 GitHub Actions 续期",
                     "detail": "续期方式：直接走 GitHub Actions，结果由 Action 仓库推送通知。",
                     "expiry": expiry,
@@ -578,27 +571,17 @@ class BotHostingRenew(_PluginBase):
         renew_res = self.__do_renew(session_token)
         if renew_res.get("ok"):
             browser_name = "SeleniumBase uc 模式" if self._use_seleniumbase else "Playwright"
+            msg = renew_res.get("detail") or ""
+            new_expiry = renew_res.get("expiry") or old_expiry
+
             if renew_res.get("confirmed") is None:
                 # Playwright 流程未自带确认结果，交给统一核对
-                ok, msg, new_expiry = self.__verify_renewal(old_expiry)
-                if ok:
-                    return {
-                        "success": True,
-                        "title": "续期成功 +4 天",
-                        "detail": f"续期方式：浏览器模拟点击（{browser_name}，{login_method}）\n{msg}",
-                        "expiry": new_expiry or expiry,
-                        "login_method": login_method,
-                        "time": self.__now_str(),
-                    }
-                # 已点击提交但未确认：转 Action 拿最终结论（不再有「待确认」状态）
-                return self.__action_fallback(
-                    msg, new_expiry or expiry, login_method, old_expiry,
-                    browser_name, submitted=True)
-
-            # SeleniumBase 已在同一浏览器会话内完成确认
-            confirmed = bool(renew_res.get("confirmed"))
-            new_expiry = renew_res.get("expiry") or old_expiry
-            msg = renew_res.get("detail") or ""
+                ok, verify_msg, verified_expiry = self.__verify_renewal(old_expiry)
+                msg = verify_msg
+                new_expiry = verified_expiry or new_expiry
+                confirmed = ok
+            else:
+                confirmed = bool(renew_res.get("confirmed"))
 
             # 未确认时补一次快速 HTTP 核对（不启动浏览器，避免又等几分钟）
             if not confirmed and self._session_token:
@@ -630,10 +613,8 @@ class BotHostingRenew(_PluginBase):
                     "time": self.__now_str(),
                 }
 
-            return self.__action_fallback(
-                msg, new_expiry or expiry, login_method,
-                old_expiry or renew_res.get("pre_expiry"),
-                browser_name, submitted=True)
+            # 已点击确认但读不到结果：转 GitHub Actions 复核，最终结果由 Action 通知
+            return self.__pending_to_action(msg, new_expiry or expiry, login_method, browser_name)
 
         err = renew_res.get("error") or "未知错误"
         # 浏览器已明确告知「按钮不可用/冷却中」，属于正常状态，不触发 Action
@@ -661,13 +642,24 @@ class BotHostingRenew(_PluginBase):
         if renew_res.get("logs"):
             logs_text = "\n执行日志：" + "；".join(renew_res.get("logs")[-6:])
 
-        # 6. 浏览器失败后转 GitHub Actions（仅「先插件后 Action」方式）
-        if self._renew_mode == RENEW_MODE_BOTH:
-            logger.info("浏览器续期失败，转 GitHub Actions 并等待真实结果")
-            return self.__action_fallback(
-                f"{err}{diag_text}{logs_text}", expiry, login_method, old_expiry,
-                "SeleniumBase uc 模式" if self._use_seleniumbase else "Playwright",
-                submitted=False)
+        # 6. 浏览器失败后转 GitHub Actions（仅「先插件后 Action」方式且有 Token）
+        if self._renew_mode == RENEW_MODE_BOTH and self._gh_token:
+            logger.info("浏览器续期失败，尝试触发 GitHub Actions（先插件后 Action 方式）")
+            ok, gh_err = self.__dispatch_github_action()
+            if ok:
+                # 触发成功即结束：Action 仓库自身会推送续期结果通知，插件静默，
+                # 保证用户只收到 Action 发出的那一条成功/失败结论
+                return {
+                    "success": True,
+                    "silent": True,
+                    "title": "已转 GitHub Actions 续期",
+                    "detail": f"浏览器续期失败：{err}\n"
+                              "已触发 GitHub Actions 执行续期，结果由 Action 仓库推送通知。",
+                    "expiry": expiry,
+                    "login_method": login_method,
+                    "time": self.__now_str(),
+                }
+            err += f"\nGitHub Actions 触发失败：{gh_err}"
 
         return {
             "success": False,
@@ -676,8 +668,58 @@ class BotHostingRenew(_PluginBase):
                       "排查建议：\n"
                       "1. 确认容器可直连 bot-hosting.net 与 challenges.cloudflare.com（Turnstile 依赖后者，浏览器不走代理）\n"
                       "2. 容器内安装 xvfb 与 xdotool 后可启用有头模式点击，过验证更稳\n"
-                      "3. 续期方式选择「先插件后续 Action」并填写 Token，浏览器失败时由 Action 兜底（Action 调用走代理）\n"
+                      "3. 续期方式选择「先插件后续 Action」或「直接走 Action」并填写 Token，浏览器失败时由 Action 兜底（Action 调用走代理）\n"
                       "4. 仍失败时请手动登录续期一次。",
+            "expiry": expiry,
+            "login_method": login_method,
+            "time": self.__now_str(),
+        }
+
+    def __pending_to_action(self, detail: str, expiry: str, login_method: str,
+                            browser_name: str) -> dict:
+        """浏览器已点击续期但无法确认结果
+
+        统一交给 GitHub Actions 跑一次脚本复核：插件只发一条「续期已提交」提示后静默结束，
+        最终成功/失败由 Action 自己推送，保证用户只会收到一个最终结论。
+        """
+        if self._renew_mode == RENEW_MODE_BOTH and self._gh_token:
+            logger.info("浏览器已提交续期但未确认到账，转 GitHub Actions 复核")
+            ok, gh_err = self.__dispatch_github_action()
+            if ok:
+                self._notify_message(
+                    "续期已提交，已转 GitHub Actions 复核",
+                    f"{detail}\n"
+                    f"已触发 {self._gh_repo} 的 {self._gh_workflow} 复核续期结果，插件到此结束。\n"
+                    "最终成功/失败由 Action 推送通知。",
+                    failure=False, expiry=expiry)
+                return {
+                    "success": True,
+                    "silent": True,  # 已单独发出提示，避免重复推送
+                    "title": "续期已提交，已转 GitHub Actions 复核",
+                    "detail": "浏览器已点击续期确认，结果由 Action 推送通知。",
+                    "expiry": expiry,
+                    "login_method": login_method,
+                    "time": self.__now_str(),
+                }
+            return {
+                "success": False,
+                "title": "续期未确认，GitHub Actions 触发失败",
+                "detail": (f"{detail}\n"
+                           f"尝试转 GitHub Actions 复核失败：{gh_err}\n"
+                           "请打开账单页手动确认是否到账：https://bot-hosting.net/a/billings"),
+                "expiry": expiry,
+                "login_method": login_method,
+                "time": self.__now_str(),
+            }
+
+        return {
+            "success": False,
+            "title": "自动续期失败（已提交但无法确认）",
+            "detail": (f"续期方式：浏览器模拟点击（{browser_name}，{login_method}）\n"
+                       f"{detail}\n"
+                       "已点击确认按钮，但账单页未刷新出新的到期时间，无法确认到账。\n"
+                       "请手动核对：https://bot-hosting.net/a/billings\n"
+                       "提示：把续期方式改为「先插件后续 Action」可由 Action 自动复核并推送最终结果。"),
             "expiry": expiry,
             "login_method": login_method,
             "time": self.__now_str(),
@@ -1172,14 +1214,12 @@ class BotHostingRenew(_PluginBase):
                     log(f"续期已确认（{detail.replace(chr(10), '；')}）")
                     return {"ok": True, "confirmed": True,
                             "expiry": final_expiry or current_expiry,
-                            "pre_expiry": current_expiry,
                             "cooldown": cooldown, "detail": detail,
                             "logs": logs[-10:]}
 
                 log("已点击确认按钮，但账单页刷新后仍未读到新的到期时间")
                 return {"ok": True, "confirmed": False,
                         "expiry": final_expiry or current_expiry,
-                        "pre_expiry": current_expiry,
                         "cooldown": cooldown,
                         "detail": "已在浏览器中点击弹窗「续期」确认按钮并提交，但账单页刷新后仍未读到新的到期时间。",
                         "logs": logs[-10:]}
@@ -1869,148 +1909,6 @@ class BotHostingRenew(_PluginBase):
         logger.info(f"[BotHosting] 已触发 GitHub Actions: {self._gh_repo}/{self._gh_workflow}")
         return True, ""
 
-    def __gh_latest_run_id(self) -> Optional[int]:
-        """取该工作流最近一次运行的 id，用于区分本次触发产生的新运行"""
-        try:
-            data = self.__gh_api(
-                "GET",
-                f"/repos/{self._gh_repo}/actions/workflows/{self._gh_workflow}/runs?per_page=1")
-            runs = data.get("workflow_runs") or []
-            return runs[0].get("id") if runs else None
-        except Exception as e:
-            logger.warning(f"[BotHosting] 查询 Action 最近运行失败: {e}")
-            return None
-
-    def __gh_run_state(self, run_id: int) -> Tuple[str, str]:
-        """返回某次运行的 (status, conclusion)，失败返回 ("", "")"""
-        try:
-            data = self.__gh_api("GET", f"/repos/{self._gh_repo}/actions/runs/{run_id}")
-            return data.get("status") or "", data.get("conclusion") or ""
-        except Exception as e:
-            logger.warning(f"[BotHosting] 查询 Action 运行 {run_id} 状态失败: {e}")
-            return "", ""
-
-    def __wait_gh_action_result(self, prev_run_id: Optional[int]) -> Tuple[Optional[bool], str, Optional[int]]:
-        """等待新触发的 Action 跑完，返回 (成功?, 说明, run_id)
-
-        成功返回 True，失败返回 False，超时/拿不到结论返回 None。
-        """
-        deadline = time.time() + GH_ACTION_WAIT_TIMEOUT
-        new_run_id = None
-        # 先等新 run 出现（dispatch 到 run 创建有延迟）
-        while time.time() < deadline:
-            time.sleep(10)
-            latest = self.__gh_latest_run_id()
-            if latest and latest != prev_run_id:
-                new_run_id = latest
-                break
-        if not new_run_id:
-            return None, "触发后未在限定时间内发现新的 Action 运行（可能被 GitHub 排队或触发未生效）", None
-
-        logger.info(f"[BotHosting] Action 运行 #{new_run_id} 已创建，等待结束...")
-        while time.time() < deadline:
-            status, conclusion = self.__gh_run_state(new_run_id)
-            if status == "completed":
-                ok = conclusion == "success"
-                return ok, f"Action 运行 #{new_run_id} 结论：{conclusion or '未知'}", new_run_id
-            time.sleep(15)
-        return None, f"Action 运行 #{new_run_id} 在 {GH_ACTION_WAIT_TIMEOUT} 秒内未结束", new_run_id
-
-    def __action_fallback(self, reason: str, expiry: str, login_method: str,
-                          old_expiry: Optional[str], browser_name: str,
-                          submitted: bool = False) -> dict:
-        """浏览器续期未确认/失败时转 GitHub Actions，并等待真实结果
-
-        submitted=True 表示浏览器已点击续期确认按钮，只是账单页没刷新出结果。
-        无论走哪条路径，最终返回的结果只有成功或失败两种。
-        """
-        if not (self._gh_token and self._gh_repo and self._gh_workflow):
-            return {
-                "success": False,
-                "title": "自动续期失败",
-                "detail": (f"失败原因：{reason}\n"
-                           "未配置 GitHub Actions 兜底（Token / 仓库 / 工作流），无法自动确认结果。\n"
-                           "排查建议：\n"
-                           "1. 确认容器可直连 bot-hosting.net 与 challenges.cloudflare.com\n"
-                           "2. 续期方式选「先插件后续 Action」并填写 GitHub Token，失败时由 Action 兜底\n"
-                           "3. 打开账单页手动核对：https://bot-hosting.net/a/billings"),
-                "expiry": expiry,
-                "login_method": login_method,
-                "time": self.__now_str(),
-            }
-
-        # 已点击确认按钮但账单页没刷新：先补一条「续期已提交」，再靠 Action 给最终结论
-        if submitted:
-            self._notify_message(
-                "续期已提交，正在通过 GitHub Actions 确认结果",
-                (f"续期方式：浏览器模拟点击（{browser_name}，{login_method}）\n"
-                 f"{reason}\n"
-                 "已点击弹窗「续期」确认按钮，但账单页暂未刷新出新的到期时间；"
-                 "已转 GitHub Actions 做二次执行与核实，稍后只推送最终成功或失败通知。"),
-                expiry=expiry, warn=True)
-
-        prev_run_id = self.__gh_latest_run_id()
-        ok, gh_err = self.__dispatch_github_action()
-        if not ok:
-            return {
-                "success": False,
-                "title": "自动续期失败",
-                "detail": f"失败原因：{reason}\nGitHub Actions 触发失败：{gh_err}",
-                "expiry": expiry,
-                "login_method": login_method,
-                "time": self.__now_str(),
-            }
-
-        act_ok, act_msg, run_id = self.__wait_gh_action_result(prev_run_id)
-        run_url = f"https://github.com/{self._gh_repo}/actions/runs/{run_id}" if run_id else ""
-
-        # Action 跑完后用 HTTP 核对真实到期时间（session_token 可能已被浏览器刷新）
-        new_expiry = old_expiry or expiry
-        expiry_extended = False
-        if self._session_token:
-            try:
-                http_exp = self.__query_status(self._session_token).get("expiry")
-            except Exception:
-                http_exp = None
-            if http_exp:
-                new_expiry = http_exp
-        if old_expiry and new_expiry and new_expiry != old_expiry:
-            old_dt = self.__parse_time(old_expiry)
-            new_dt = self.__parse_time(new_expiry)
-            expiry_extended = bool(old_dt and new_dt and new_dt > old_dt)
-
-        # 到期时间已延后 = 续期确实生效（浏览器那次可能已成功，Action 反而会因冷却失败）
-        if expiry_extended or act_ok:
-            detail = f"续期方式：浏览器模拟点击后转 GitHub Actions\n{reason}\n{act_msg}"
-            if expiry_extended and old_expiry:
-                detail += f"\n到期时间：{old_expiry} → {new_expiry}"
-            elif new_expiry and new_expiry != "（未获取到）":
-                detail += f"\n当前到期时间：{new_expiry}"
-            if run_url:
-                detail += f"\nActions 页面：{run_url}"
-            return {
-                "success": True,
-                "title": "续期成功 +4 天",
-                "detail": detail,
-                "expiry": new_expiry,
-                "login_method": login_method,
-                "time": self.__now_str(),
-            }
-
-        detail = f"失败原因：{reason}\n{act_msg}"
-        if run_url:
-            detail += f"\nActions 页面：{run_url}"
-        detail += ("\n排查建议：打开账单页确认是否已续期；"
-                   "若 Action 日志显示 Turnstile 失败，请检查容器网络能否访问 challenges.cloudflare.com")
-        return {
-            "success": False,
-            "title": "自动续期失败",
-            "detail": detail,
-            "expiry": new_expiry,
-            "login_method": login_method,
-            "time": self.__now_str(),
-        }
-
     @staticmethod
     def __map_gh_error(err: str) -> str:
         if "401" in err:
@@ -2536,19 +2434,17 @@ class BotHostingRenew(_PluginBase):
         self._notify_message(result.get("title") or "执行完成",
                              result.get("detail") or "",
                              failure=not result.get("success"),
-                             expiry=result.get("expiry"),
-                             warn=bool(result.get("warn")))
+                             expiry=result.get("expiry"))
 
     def _notify_message(self, title: str, text: str, failure: bool = False,
-                        expiry: str = "", warn: bool = False):
+                        expiry: str = ""):
         """拼接通知文案并推送（MP 消息渠道，含企业微信），并按通知策略过滤"""
         if self._notify == NOTIFY_OFF:
             return
-        if self._notify == NOTIFY_FAILURE and not failure and not warn:
+        if self._notify == NOTIFY_FAILURE and not failure:
             return
         lines = ["Bot-Hosting 自动续期通知", ""]
-        icon = "❌ " if failure else ("⚠️ " if warn else "✅ ")
-        lines.append(icon + title)
+        lines.append(("❌ " if failure else "✅ ") + title)
         if self._email:
             lines.append(f"👤 账户: {self.__mask_email(self._email)}")
         if expiry:
