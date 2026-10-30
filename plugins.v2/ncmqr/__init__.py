@@ -3,7 +3,8 @@
 功能：
   1. 暴露 POST /api/v1/plugin/NcmQr/qr（apikey 鉴权）：接收 ncm-daily 插件推送的登录二维码，
      上传企微临时素材（media/upload）并发送企业微信图片消息
-  2. 监听 UserMessage 事件：在企业微信回复「登录」关键词时，反向调 ncm-daily 的免 JWT 端点
+  2. 注册 /ncm_login 指令（企微菜单「登录网易云」按钮）：直接执行，不经过大模型对话链路
+  3. 监听 UserMessage 事件：在企业微信回复「登录」关键词时，反向调 ncm-daily 的免 JWT 端点
      取最新二维码并推送
 
 企微 API 走反代域名拼 URL（与 MP 通知模块同款）：优先取插件配置 proxy，其次 MP 内置
@@ -31,11 +32,11 @@ class NcmQr(_PluginBase):
     # 插件名称
     plugin_name = "网易云登录二维码推送"
     # 插件描述
-    plugin_desc = "接收 Songloft「网易云日推」插件推送的登录二维码，经企微 API 反代域名上传临时素材后发送企业微信图片消息；图片失败自动降级为扫码页链接；支持聊天关键词触发重新获取。"
+    plugin_desc = "接收 Songloft「网易云日推」插件推送的登录二维码，经企微 API 反代域名上传临时素材后发送企业微信图片消息；注册 /ncm_login 指令（企微菜单「登录网易云」），不走大模型对话链路；图片失败自动降级为扫码页链接。"
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/Cxquang/songloft-ncm-daily/main/static/icon.svg"
     # 插件版本
-    plugin_version = "0.2.0"
+    plugin_version = "0.2.1"
     # 插件作者
     plugin_author = "Cxquang"
     # 作者主页
@@ -79,7 +80,15 @@ class NcmQr(_PluginBase):
 
     @staticmethod
     def get_command() -> List[Dict[str, Any]]:
-        pass
+        # 注册 /ncm_login 指令：MP 以「/」开头识别为指令直接执行（CommandExcute → PluginAction），
+        # 不进入大模型对话链路；category 分组进企微菜单（一级菜单组名），按钮名取 desc
+        return [{
+            "cmd": "/ncm_login",
+            "event": EventType.PluginAction,
+            "desc": "登录网易云",
+            "category": "站点",
+            "data": {"action": "ncm_login"}
+        }]
 
     def get_api(self) -> List[Dict[str, Any]]:
         return [{
@@ -111,7 +120,7 @@ class NcmQr(_PluginBase):
                         {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
                             {"component": "VTextField", "props": {"model": "agentid", "label": "应用AgentId"}}]},
                         {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
-                            {"component": "VTextField", "props": {"model": "touser", "label": "发送目标用户", "placeholder": "@all"}}]},
+                            {"component": "VTextField", "props": {"model": "touser", "label": "发送目标用户（企微通讯录账号，多人用 | 分隔，@all=可见范围全体）", "placeholder": "@all"}}]},
                     ]},
                     {"component": "VRow", "content": [
                         {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
@@ -151,7 +160,7 @@ class NcmQr(_PluginBase):
                                 "props": {
                                     "type": "info",
                                     "variant": "tonal",
-                                    "text": "本插件配合 Songloft「网易云日推」插件（ncm-daily）使用：ncm-daily 检测到登录过期时，通过本插件把二维码推送到企业微信图片消息（企微 API 走反代域名，与 MP 通知同一出口，规避可信 IP 限制）；图片发送失败时自动降级为文字消息并附带扫码页链接，手机点开即可长按识别；在企业微信回复关键词（默认「登录」）可随时触发重新获取二维码。"
+                                    "text": "本插件配合 Songloft「网易云日推」插件（ncm-daily）使用：ncm-daily 检测到登录过期时，通过本插件把二维码推送到企业微信图片消息（企微 API 走反代域名，与 MP 通知同一出口，规避可信 IP 限制）；已注册 /ncm_login 指令，在企业微信点菜单「登录网易云」按钮或发送 /ncm_login 即可重新获取二维码，二维码发给触发者本人，且不走大模型对话链路；图片发送失败时自动降级为文字消息并附带扫码页链接，手机点开即可长按识别。"
                                 }
                             }
                         ]
@@ -182,10 +191,26 @@ class NcmQr(_PluginBase):
             logger.error(f"NcmQr 推送失败: {e}")
             return {"result": False, "message": str(e)}
 
-    # ---------- 关键词触发 ----------
+    # ---------- 触发入口（关键词 / 指令共用） ----------
+
+    def _fetch_and_push_qr(self, touser: Optional[str]) -> None:
+        """从 ncm-daily 拉取最新二维码并推送给 touser（为空时用配置的默认目标）"""
+        if not (self._ncm_base and self._ncm_secret):
+            self._send_text(touser, "NcmQr 未配置 Songloft 地址或回调密钥")
+            return
+        url = f"{self._ncm_base}/api/v1/jsplugin/ncm-daily/public/qr"
+        resp = self._http("GET", url, params={"secret": self._ncm_secret})
+        data = resp.json()
+        if not data.get("ok"):
+            self._send_text(touser, f"ncm-daily 返回失败: {data.get('error') or data}")
+            return
+        png = self._decode_image(data.get("qrimg"))
+        hint = f"请扫码续期（第 {data.get('round')}/{data.get('maxRounds')} 轮，2分钟内有效）"
+        self._push_qr_bytes(png, hint, touser)
 
     @eventmanager.register(EventType.UserMessage)
     def on_user_message(self, event: Event):
+        """关键词触发：企业微信回复「登录」时重新获取二维码（备用入口）"""
         if not self._enabled or not self._keyword:
             return
         try:
@@ -194,21 +219,25 @@ class NcmQr(_PluginBase):
             if text != self._keyword:
                 return
             userid = data.get("userid") or data.get("user_id") or None
-            if not (self._ncm_base and self._ncm_secret):
-                self._send_text(userid, "NcmQr 未配置 Songloft 地址或回调密钥")
-                return
-            url = f"{self._ncm_base}/api/v1/jsplugin/ncm-daily/public/qr"
-            resp = self._http("GET", url, params={"secret": self._ncm_secret})
-            data2 = resp.json()
-            if not data2.get("ok"):
-                self._send_text(userid, f"ncm-daily 返回失败: {data2.get('error') or data2}")
-                return
-            png = self._decode_image(data2.get("qrimg"))
-            hint = f"请扫码续期（第 {data2.get('round')}/{data2.get('maxRounds')} 轮，2分钟内有效）"
-            self._push_qr_bytes(png, hint, userid)
+            self._fetch_and_push_qr(userid)
             logger.info("NcmQr 关键词触发二维码推送完成")
         except Exception as e:
             logger.error(f"NcmQr 关键词处理失败: {e}")
+
+    @eventmanager.register(EventType.PluginAction)
+    def on_plugin_action(self, event: Event):
+        """指令触发：企微菜单「登录网易云」按钮或发送 /ncm_login 时执行
+
+        MP 指令链会自动在 event_data 里附加触发者 user（企微账号），二维码推送给触发者本人
+        """
+        data = getattr(event, "event_data", None) or {}
+        if not self._enabled or data.get("action") != "ncm_login":
+            return
+        try:
+            self._fetch_and_push_qr(data.get("user"))
+            logger.info("NcmQr 指令触发二维码推送完成")
+        except Exception as e:
+            logger.error(f"NcmQr 指令处理失败: {e}")
 
     # ---------- 内部工具 ----------
 
