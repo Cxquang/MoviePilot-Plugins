@@ -72,12 +72,11 @@ class NcmQr(_PluginBase):
     def get_state(self) -> bool:
         return self._enabled
 
-    def stop_service(self):
+    @staticmethod
+    def get_command() -> List[Dict[str, Any]]:
         pass
 
     def get_api(self) -> List[Dict[str, Any]]:
-        if not self._enabled:
-            return []
         return [{
             "path": "/qr",
             "endpoint": self.push_qr,
@@ -86,7 +85,7 @@ class NcmQr(_PluginBase):
             "summary": "接收网易云登录二维码并推送到企业微信",
         }]
 
-    def get_form(self):
+    def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
         return [
             {
                 "component": "VForm",
@@ -121,12 +120,50 @@ class NcmQr(_PluginBase):
                     ]},
                 ],
             }
+        ], {
+            "enabled": False,
+            "keyword": "登录",
+            "corpid": "",
+            "corpsecret": "",
+            "agentid": "",
+            "touser": "@all",
+            "proxy": "",
+            "ncm_base": "",
+            "ncm_secret": ""
+        }
+
+    def get_page(self) -> List[dict]:
+        return [
+            {
+                "component": "VRow",
+                "content": [
+                    {
+                        "component": "VCol",
+                        "props": {"cols": 12},
+                        "content": [
+                            {
+                                "component": "VAlert",
+                                "props": {
+                                    "type": "info",
+                                    "variant": "tonal",
+                                    "text": "本插件配合 Songloft「网易云日推」插件（ncm-daily）使用：ncm-daily 检测到登录过期时，通过本插件把二维码推送到企业微信图片消息（经企微代理上传临时素材，无需公网入站）；在企业微信回复关键词（默认「登录」）可随时触发重新获取二维码。"
+                                }
+                            }
+                        ]
+                    }
+                ]
+            }
         ]
+
+    def stop_service(self):
+        pass
 
     # ---------- 对外端点 ----------
 
     async def push_qr(self, request: Request):
         """接收 ncm-daily 推来的二维码并转发到企业微信"""
+        if not self._enabled:
+            return {"result": False, "message": "插件未启用"}
         try:
             body = await request.json()
         except Exception:
