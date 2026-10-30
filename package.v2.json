@@ -1,13 +1,14 @@
 {
   "NcmQr": {
-    "name": "网易云登录二维码推送",
-    "description": "接收 Songloft「网易云日推」插件推送的登录二维码并发送企业微信图片消息；企微凭据与反代出口默认自动借用 MP「消息通知」渠道配置（与入库通知同链路，无需重复填写）；注册 /ncm_login 指令（企微菜单「登录网易云」），不走大模型对话链路；直发失败自动降级为扫码页链接，文字直发也失败时改经 MP 消息渠道发送",
+    "name": "网易云验证码登录转发",
+    "description": "配合 Songloft「网易云日推」插件：把登录验证码提示推送到企业微信，并在企业微信发送 /code 123456 时把验证码转发给 ncm-daily 完成登录；企微凭据与反代出口默认自动借用 MP「消息通知」渠道配置（与入库通知同链路，无需重复填写）；文字直发失败时自动改经 MP 消息渠道发送",
     "labels": "消息通知",
-    "version": "0.2.2",
+    "version": "0.4.0",
     "icon": "https://raw.githubusercontent.com/Cxquang/songloft-ncm-daily/main/static/icon.svg",
     "author": "Cxquang",
     "level": 1,
     "history": {
+      "v0.4.0": "扫码登录确认失效，整体改为手机号短信验证码登录：新增 POST /notify 文字通知接口（ncm-daily 推送验证码提示/登录结果/同步日报）；注册 /code 指令（show=false 不出现在企微菜单），企微发送 /code 123456 即转发给 ncm-daily 的 /public/code 完成登录，只发 /code 则重新请求短信验证码；移除 /ncm_login 指令、企微「登录网易云」菜单按钮、UserMessage「登录」关键词与二维码上传/推送逻辑",
       "v0.2.2": "根治 60020 可信 IP 报错：MP v2 的企微配置不在全局环境变量（WECHAT_PROXY 是 v1 遗留键），而是存在「消息通知渠道」的配置库里；本版本自动借用该渠道配置（ServiceConfigHelper 读取，与入库通知同一条链路），凭据/反代/管理员表单留空即用，无需重复配置；文字直发也失败时自动改经 MP 自己的 MessageChain 消息渠道发送，三重保险",
       "v0.2.1": "注册 /ncm_login 指令（企微菜单「登录网易云」按钮）：/ 开头指令由 MP 指令链直接执行，不经过大模型对话分析；二维码推送给触发者本人的企微账号；关键词触发保留为备用入口",
       "v0.2.0": "企微 API 改为反代域名拼 URL（与 MP 通知模块同款，gettoken/media/upload/message/send 全部走 {proxy}/cgi-bin/...），根治 60020 可信 IP 报错；图片发送失败自动降级为文字消息并附 ncm-daily 扫码页链接（/public/qr-page），手机点开长按识别；代理优先级：插件配置 > MP 内置 WECHAT_PROXY > 直连官方",
