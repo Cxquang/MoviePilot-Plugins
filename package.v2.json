@@ -3,12 +3,13 @@
     "name": "网易云登录二维码推送",
     "description": "接收 Songloft「网易云日推」插件推送的登录二维码，经企微代理上传临时素材后发送企业微信图片消息；支持企业微信回复「登录」关键词触发重新获取",
     "labels": "消息通知",
-    "version": "0.1.1",
+    "version": "0.1.2",
     "icon": "https://raw.githubusercontent.com/Cxquang/songloft-ncm-daily/main/static/icon.svg",
     "author": "Cxquang",
     "level": 1,
     "history": {
-      "v0.1.1": "修复插件无法加载的问题：补齐 _PluginBase 必需的 get_command / get_page 抽象方法实现，get_form 改为返回（页面元素 + 配置默认值）元组，API 无条件注册并在入口检查启用状态",
+      "v0.1.2": "修复 v0.1.1 发布不完整导致的加载失败（NameError: Tuple）：补全 typing.Tuple 导入；本次为完整可用版本",
+      "v0.1.1": "补齐 _PluginBase 必需的 get_command / get_page 抽象方法，get_form 改为返回（页面元素 + 配置默认值）元组，API 无条件注册并在入口检查启用状态",
       "v0.1.0": "初始版本：POST /api/v1/plugin/NcmQr/qr 接收 base64 登录二维码，经企微代理上传临时素材后发送企业微信图片消息（无需公网入站）；监听 UserMessage 事件，企业微信回复「登录」关键词时反向调用 Songloft ncm-daily 免 JWT 端点获取新码"
     }
   }
