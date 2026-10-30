@@ -2,15 +2,20 @@
 
 功能：
   1. 暴露 POST /api/v1/plugin/NcmQr/qr（apikey 鉴权）：接收 ncm-daily 插件推送的登录二维码，
-     经企微代理调 qyapi.weixin.qq.com 上传临时素材（media/upload）并发送企业微信图片消息
+     上传企微临时素材（media/upload）并发送企业微信图片消息
   2. 监听 UserMessage 事件：在企业微信回复「登录」关键词时，反向调 ncm-daily 的免 JWT 端点
      取最新二维码并推送
+
+企微 API 走反代域名拼 URL（与 MP 通知模块同款）：优先取插件配置 proxy，其次 MP 内置
+WECHAT_PROXY，均为空则直连官方 qyapi.weixin.qq.com。图片消息失败时自动降级为文字消息，
+附带 ncm-daily 扫码页链接（/public/qr-page），手机点开即可长按识别扫码。
 """
 import base64
 import os
 import re
 import time
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import quote
 
 import requests
 from fastapi import Request
@@ -26,11 +31,11 @@ class NcmQr(_PluginBase):
     # 插件名称
     plugin_name = "网易云登录二维码推送"
     # 插件描述
-    plugin_desc = "接收 Songloft「网易云日推」插件推送的登录二维码，经企微代理上传临时素材后发送企业微信图片消息；支持聊天关键词触发重新获取。"
+    plugin_desc = "接收 Songloft「网易云日推」插件推送的登录二维码，经企微 API 反代域名上传临时素材后发送企业微信图片消息；图片失败自动降级为扫码页链接；支持聊天关键词触发重新获取。"
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/Cxquang/songloft-ncm-daily/main/static/icon.svg"
     # 插件版本
-    plugin_version = "0.1.2"
+    plugin_version = "0.2.0"
     # 插件作者
     plugin_author = "Cxquang"
     # 作者主页
@@ -110,9 +115,9 @@ class NcmQr(_PluginBase):
                     ]},
                     {"component": "VRow", "content": [
                         {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
-                            {"component": "VTextField", "props": {"model": "proxy", "label": "企微代理（留空自动读 MP 内置 WECHAT_PROXY）"}}]},
+                            {"component": "VTextField", "props": {"model": "proxy", "label": "企微 API 反代域名（如 https://wx.example.com，留空读 MP 的 WECHAT_PROXY）"}}]},
                         {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
-                            {"component": "VTextField", "props": {"model": "ncm_base", "label": "Songloft 地址", "placeholder": "http://192.168.123.176:58091"}}]},
+                            {"component": "VTextField", "props": {"model": "ncm_base", "label": "Songloft 地址（需手机可访问，用于扫码回退链接）", "placeholder": "http://192.168.123.176:58091"}}]},
                     ]},
                     {"component": "VRow", "content": [
                         {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
@@ -146,7 +151,7 @@ class NcmQr(_PluginBase):
                                 "props": {
                                     "type": "info",
                                     "variant": "tonal",
-                                    "text": "本插件配合 Songloft「网易云日推」插件（ncm-daily）使用：ncm-daily 检测到登录过期时，通过本插件把二维码推送到企业微信图片消息（经企微代理上传临时素材，无需公网入站）；在企业微信回复关键词（默认「登录」）可随时触发重新获取二维码。"
+                                    "text": "本插件配合 Songloft「网易云日推」插件（ncm-daily）使用：ncm-daily 检测到登录过期时，通过本插件把二维码推送到企业微信图片消息（企微 API 走反代域名，与 MP 通知同一出口，规避可信 IP 限制）；图片发送失败时自动降级为文字消息并附带扫码页链接，手机点开即可长按识别；在企业微信回复关键词（默认「登录」）可随时触发重新获取二维码。"
                                 }
                             }
                         ]
@@ -207,15 +212,23 @@ class NcmQr(_PluginBase):
 
     # ---------- 内部工具 ----------
 
-    def _proxies(self) -> Dict[str, str]:
-        proxy = self._proxy or getattr(settings, "WECHAT_PROXY", None) or os.getenv("WECHAT_PROXY", "")
+    def _api_base(self) -> str:
+        """企微 API 出口：反代域名拼 URL（MP 同款），而不是 requests.proxies。
+
+        优先级：插件配置 proxy > MP 内置 WECHAT_PROXY > 直连官方。
+        """
+        proxy = (self._proxy
+                 or getattr(settings, "WECHAT_PROXY", None)
+                 or os.getenv("WECHAT_PROXY", "")).strip()
         if proxy:
-            return {"http": proxy, "https": proxy}
-        return {}
+            proxy = proxy.rstrip("/")
+            if not re.match(r"^https?://", proxy, re.I):
+                proxy = "https://" + proxy
+            return proxy
+        return "https://qyapi.weixin.qq.com"
 
     def _http(self, method: str, url: str, **kwargs):
         kwargs.setdefault("timeout", 20)
-        kwargs.setdefault("proxies", self._proxies())
         return requests.request(method, url, **kwargs)
 
     def _get_token(self) -> str:
@@ -223,7 +236,7 @@ class NcmQr(_PluginBase):
             return self._token_cache
         if not (self._corpid and self._corpsecret):
             raise RuntimeError("未配置企业ID或应用Secret")
-        url = f"https://qyapi.weixin.qq.com/cgi-bin/gettoken?corpid={self._corpid}&corpsecret={self._corpsecret}"
+        url = f"{self._api_base()}/cgi-bin/gettoken?corpid={self._corpid}&corpsecret={self._corpsecret}"
         data = self._http("GET", url).json()
         if data.get("errcode") != 0:
             raise RuntimeError(f"gettoken 失败: {data}")
@@ -233,7 +246,7 @@ class NcmQr(_PluginBase):
 
     def _upload_image(self, png_bytes: bytes) -> str:
         token = self._get_token()
-        url = f"https://qyapi.weixin.qq.com/cgi-bin/media/upload?access_token={token}&type=image"
+        url = f"{self._api_base()}/cgi-bin/media/upload?access_token={token}&type=image"
         files = {"media": ("ncm-qr.png", png_bytes, "image/png")}
         data = self._http("POST", url, files=files).json()
         if data.get("errcode") != 0:
@@ -246,7 +259,7 @@ class NcmQr(_PluginBase):
         token = self._get_token()
         payload = {"touser": touser or self._touser or "@all", "agentid": int(self._agentid)}
         payload.update(msg)
-        url = f"https://qyapi.weixin.qq.com/cgi-bin/message/send?access_token={token}"
+        url = f"{self._api_base()}/cgi-bin/message/send?access_token={token}"
         data = self._http("POST", url, json=payload).json()
         if data.get("errcode") != 0:
             raise RuntimeError(f"发送失败: {data}")
@@ -254,9 +267,28 @@ class NcmQr(_PluginBase):
     def _send_text(self, touser: Optional[str], text: str) -> None:
         self._send_msg(touser, {"msgtype": "text", "text": {"content": text}})
 
+    def _qr_page_url(self) -> str:
+        """ncm-daily 扫码页链接；未配置 Songloft 地址/密钥时返回空串。"""
+        if not (self._ncm_base and self._ncm_secret):
+            return ""
+        return (f"{self._ncm_base}/api/v1/jsplugin/ncm-daily/public/qr-page"
+                f"?secret={quote(self._ncm_secret, safe='')}")
+
     def _push_qr_bytes(self, png_bytes: bytes, text: str, touser: Optional[str] = None) -> None:
-        media_id = self._upload_image(png_bytes)
-        self._send_msg(touser, {"msgtype": "image", "image": {"media_id": media_id}})
+        try:
+            media_id = self._upload_image(png_bytes)
+            self._send_msg(touser, {"msgtype": "image", "image": {"media_id": media_id}})
+        except Exception as e:
+            logger.warning(f"NcmQr 图片消息发送失败，降级为扫码链接: {e}")
+            lines = [text or "网易云登录二维码"]
+            link = self._qr_page_url()
+            if link:
+                lines.append("图片发送失败，请点开链接扫码（约2分钟内有效）：")
+                lines.append(link)
+            else:
+                lines.append(f"图片发送失败，且未配置 Songloft 地址/回调密钥，无法生成扫码链接: {e}")
+            self._send_text(touser, "\n".join(lines))
+            return
         if text:
             self._send_text(touser, text)
 
