@@ -7,9 +7,11 @@
   3. 监听 UserMessage 事件：在企业微信回复「登录」关键词时，反向调 ncm-daily 的免 JWT 端点
      取最新二维码并推送
 
-企微 API 走反代域名拼 URL（与 MP 通知模块同款）：优先取插件配置 proxy，其次 MP 内置
-WECHAT_PROXY，均为空则直连官方 qyapi.weixin.qq.com。图片消息失败时自动降级为文字消息，
-附带 ncm-daily 扫码页链接（/public/qr-page），手机点开即可长按识别扫码。
+企微凭据与出口：MP v2 的企微配置存放在「消息通知渠道」的模块配置里（WECHAT_CORPID /
+WECHAT_APP_SECRET / WECHAT_APP_ID / WECHAT_PROXY），不在全局环境变量中。本插件默认自动
+借用该渠道配置（即 MP 入库通知那条链路，凭据与反代出口天然可用），插件表单里的字段可覆盖。
+图片直发失败时，自动改经 MP 自己的消息渠道（MessageChain）发送 ncm-daily 扫码页链接，
+不依赖可信 IP。所有报错附带「出口」域名便于定位。
 """
 import base64
 import os
@@ -32,11 +34,11 @@ class NcmQr(_PluginBase):
     # 插件名称
     plugin_name = "网易云登录二维码推送"
     # 插件描述
-    plugin_desc = "接收 Songloft「网易云日推」插件推送的登录二维码，经企微 API 反代域名上传临时素材后发送企业微信图片消息；注册 /ncm_login 指令（企微菜单「登录网易云」），不走大模型对话链路；图片失败自动降级为扫码页链接。"
+    plugin_desc = "接收 Songloft「网易云日推」插件推送的登录二维码并推送企业微信图片消息；自动借用 MP 企业微信渠道的凭据与反代出口（即入库通知那条链路），无需重复配置；注册 /ncm_login 指令直达触发；图片失败自动经 MP 消息渠道发扫码页链接。"
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/Cxquang/songloft-ncm-daily/main/static/icon.svg"
     # 插件版本
-    plugin_version = "0.2.1"
+    plugin_version = "0.2.2"
     # 插件作者
     plugin_author = "Cxquang"
     # 作者主页
@@ -62,18 +64,31 @@ class NcmQr(_PluginBase):
     _token_expire = 0.0
 
     def init_plugin(self, config: dict = None):
+        # MP v2 的企微渠道配置存于模块配置（数据库），借用之；表单字段非空时优先
+        borrowed = self._borrow_mp_wechat_conf()
         if config:
             self._enabled = bool(config.get("enabled"))
-            self._corpid = (config.get("corpid") or "").strip()
-            self._corpsecret = (config.get("corpsecret") or "").strip()
-            self._agentid = (config.get("agentid") or "").strip()
-            self._touser = (config.get("touser") or "@all").strip()
-            self._proxy = (config.get("proxy") or "").strip()
+            self._corpid = (config.get("corpid") or "").strip() \
+                or str(borrowed.get("WECHAT_CORPID") or "").strip()
+            self._corpsecret = (config.get("corpsecret") or "").strip() \
+                or str(borrowed.get("WECHAT_APP_SECRET") or "").strip()
+            self._agentid = (config.get("agentid") or "").strip() \
+                or str(borrowed.get("WECHAT_APP_ID") or "").strip()
+            self._touser = (config.get("touser") or "").strip()
+            self._proxy = (config.get("proxy") or "").strip() \
+                or str(borrowed.get("WECHAT_PROXY") or "").strip()
             self._keyword = (config.get("keyword") or "登录").strip()
             self._ncm_base = (config.get("ncm_base") or "").strip().rstrip("/")
             self._ncm_secret = (config.get("ncm_secret") or "").strip()
+            if not self._touser:
+                admins = [a.strip() for a in
+                          str(borrowed.get("WECHAT_ADMINS") or "").split(",") if a.strip()]
+                self._touser = admins[0] if admins else "@all"
         self._token_cache = None
         self._token_expire = 0.0
+        if self._enabled:
+            src = "自动借用 MP 企微渠道" if borrowed else "插件独立配置（未借用到 MP 渠道）"
+            logger.info(f"NcmQr 已就绪：凭据来源 {src}，企微出口 {self._api_base()}")
 
     def get_state(self) -> bool:
         return self._enabled
@@ -112,19 +127,19 @@ class NcmQr(_PluginBase):
                     ]},
                     {"component": "VRow", "content": [
                         {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
-                            {"component": "VTextField", "props": {"model": "corpid", "label": "企业ID（corpid）"}}]},
+                            {"component": "VTextField", "props": {"model": "corpid", "label": "企业ID corpid（留空自动借用 MP 企业微信渠道配置）"}}]},
                         {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
-                            {"component": "VTextField", "props": {"model": "corpsecret", "label": "应用Secret", "type": "password"}}]},
+                            {"component": "VTextField", "props": {"model": "corpsecret", "label": "应用Secret（留空自动借用 MP 企业微信渠道配置）", "type": "password"}}]},
                     ]},
                     {"component": "VRow", "content": [
                         {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
-                            {"component": "VTextField", "props": {"model": "agentid", "label": "应用AgentId"}}]},
+                            {"component": "VTextField", "props": {"model": "agentid", "label": "应用AgentId（留空自动借用 MP 企业微信渠道配置）"}}]},
                         {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
-                            {"component": "VTextField", "props": {"model": "touser", "label": "发送目标用户（企微通讯录账号，多人用 | 分隔，@all=可见范围全体）", "placeholder": "@all"}}]},
+                            {"component": "VTextField", "props": {"model": "touser", "label": "发送目标用户（企微账号，多人|分隔；留空=MP 渠道管理员，兜底 @all）", "placeholder": "@all"}}]},
                     ]},
                     {"component": "VRow", "content": [
                         {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
-                            {"component": "VTextField", "props": {"model": "proxy", "label": "企微 API 反代域名（如 https://wx.example.com，留空读 MP 的 WECHAT_PROXY）"}}]},
+                            {"component": "VTextField", "props": {"model": "proxy", "label": "企微 API 反代域名（留空依次读 MP 渠道配置 / 全局 WECHAT_PROXY）"}}]},
                         {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
                             {"component": "VTextField", "props": {"model": "ncm_base", "label": "Songloft 地址（需手机可访问，用于扫码回退链接）", "placeholder": "http://192.168.123.176:58091"}}]},
                     ]},
@@ -160,7 +175,7 @@ class NcmQr(_PluginBase):
                                 "props": {
                                     "type": "info",
                                     "variant": "tonal",
-                                    "text": "本插件配合 Songloft「网易云日推」插件（ncm-daily）使用：ncm-daily 检测到登录过期时，通过本插件把二维码推送到企业微信图片消息（企微 API 走反代域名，与 MP 通知同一出口，规避可信 IP 限制）；已注册 /ncm_login 指令，在企业微信点菜单「登录网易云」按钮或发送 /ncm_login 即可重新获取二维码，二维码发给触发者本人，且不走大模型对话链路；图片发送失败时自动降级为文字消息并附带扫码页链接，手机点开即可长按识别。"
+                                    "text": "本插件配合 Songloft「网易云日推」插件（ncm-daily）使用：ncm-daily 检测到登录过期时，通过本插件把二维码推送到企业微信图片消息。企微凭据与反代出口默认自动借用 MP「消息通知」里已配置的企业微信渠道（与入库通知同一条链路，无需重复填写，可信 IP 天然放行）；已注册 /ncm_login 指令，在企业微信点菜单「登录网易云」按钮或发送 /ncm_login 即可重新获取二维码，二维码发给触发者本人，且不走大模型对话链路；直发失败时自动降级为文字消息并附带扫码页链接，文字直发也失败时改经 MP 自己的消息渠道发送，手机点开即可长按识别。"
                                 }
                             }
                         ]
@@ -196,13 +211,13 @@ class NcmQr(_PluginBase):
     def _fetch_and_push_qr(self, touser: Optional[str]) -> None:
         """从 ncm-daily 拉取最新二维码并推送给 touser（为空时用配置的默认目标）"""
         if not (self._ncm_base and self._ncm_secret):
-            self._send_text(touser, "NcmQr 未配置 Songloft 地址或回调密钥")
+            self._notify_text(touser, "NcmQr 未配置 Songloft 地址或回调密钥")
             return
         url = f"{self._ncm_base}/api/v1/jsplugin/ncm-daily/public/qr"
         resp = self._http("GET", url, params={"secret": self._ncm_secret})
         data = resp.json()
         if not data.get("ok"):
-            self._send_text(touser, f"ncm-daily 返回失败: {data.get('error') or data}")
+            self._notify_text(touser, f"ncm-daily 返回失败: {data.get('error') or data}")
             return
         png = self._decode_image(data.get("qrimg"))
         hint = f"请扫码续期（第 {data.get('round')}/{data.get('maxRounds')} 轮，2分钟内有效）"
@@ -239,12 +254,65 @@ class NcmQr(_PluginBase):
         except Exception as e:
             logger.error(f"NcmQr 指令处理失败: {e}")
 
+    # ---------- MP 渠道借用与兜底 ----------
+
+    @staticmethod
+    def _borrow_mp_wechat_conf() -> Dict[str, str]:
+        """借用 MP「消息通知」里已启用的企业微信渠道配置（凭据 + 反代出口）。
+
+        MP v2 的企微配置不在全局环境变量（WECHAT_PROXY 是 v1 遗留键），而是存在
+        渠道配置数据库里，由 WechatModule 经 ServiceConfigHelper 读取——即 MP 入库
+        通知使用的那条链路，凭据与反代出口天然可用且可信 IP 已放行。
+        """
+        try:
+            from app.helper.service import ServiceConfigHelper
+            for conf in ServiceConfigHelper.get_notification_configs() or []:
+                if not getattr(conf, "enabled", False):
+                    continue
+                if str(getattr(conf, "type", "") or "").lower() != "wechat":
+                    continue
+                cfg = getattr(conf, "config", None) or {}
+                if cfg.get("WECHAT_CORPID") and cfg.get("WECHAT_APP_SECRET") \
+                        and cfg.get("WECHAT_APP_ID"):
+                    return {k: str(v) for k, v in cfg.items() if v is not None}
+        except Exception as e:
+            logger.debug(f"NcmQr 借用 MP 企微渠道配置失败: {e}")
+        return {}
+
+    def _send_via_mp_channel(self, touser: Optional[str], title: str, text: str) -> bool:
+        """经 MP 自己的消息渠道发送（与入库通知同链路），复用 MP 已配置好的企微客户端。"""
+        try:
+            from app.chain.message import MessageChain
+            from app.schemas import MessageChannel, Notification
+            MessageChain().post_message(Notification(
+                channel=MessageChannel.Wechat,
+                title=title or "网易云登录二维码",
+                text=text,
+                userid=touser or self._touser or "@all",
+            ))
+            logger.info("NcmQr 已经 MP 消息渠道发送")
+            return True
+        except Exception as e:
+            logger.warning(f"NcmQr 经 MP 消息渠道发送失败: {e}")
+            return False
+
+    def _notify_text(self, touser: Optional[str], text: str,
+                     title: str = "网易云登录二维码") -> bool:
+        """发文字消息：优先本插件凭据直发，失败（如 60020 可信 IP）改走 MP 消息渠道。"""
+        try:
+            self._send_text(touser, text)
+            return True
+        except Exception as e:
+            logger.warning(f"NcmQr 文字直发失败，改走 MP 消息渠道: {e}")
+            return self._send_via_mp_channel(touser, title, text)
+
     # ---------- 内部工具 ----------
 
     def _api_base(self) -> str:
         """企微 API 出口：反代域名拼 URL（MP 同款），而不是 requests.proxies。
 
-        优先级：插件配置 proxy > MP 内置 WECHAT_PROXY > 直连官方。
+        优先级：插件配置 proxy > MP 渠道借用（init 时已写入 _proxy）> 全局
+        WECHAT_PROXY > 直连官方。
         """
         proxy = (self._proxy
                  or getattr(settings, "WECHAT_PROXY", None)
@@ -312,14 +380,14 @@ class NcmQr(_PluginBase):
             lines = [text or "网易云登录二维码"]
             link = self._qr_page_url()
             if link:
-                lines.append("图片发送失败，请点开链接扫码（约2分钟内有效）：")
+                lines.append("图片直发失败，请点开链接扫码（约2分钟内有效）：")
                 lines.append(link)
             else:
-                lines.append(f"图片发送失败，且未配置 Songloft 地址/回调密钥，无法生成扫码链接: {e}")
-            self._send_text(touser, "\n".join(lines))
+                lines.append(f"图片直发失败，且未配置 Songloft 地址/回调密钥，无法生成扫码链接: {e}")
+            self._notify_text(touser, "\n".join(lines))
             return
         if text:
-            self._send_text(touser, text)
+            self._notify_text(touser, text)
 
     @staticmethod
     def _decode_image(image: str) -> bytes:
