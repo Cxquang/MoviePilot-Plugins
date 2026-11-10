@@ -247,7 +247,7 @@ class BotHostingRenew(_PluginBase):
     # 插件图标
     plugin_icon = "https://bot-hosting.net/favicon.ico"
     # 插件版本
-    plugin_version = "1.3.17"
+    plugin_version = "1.3.18"
     # 插件作者
     plugin_author = "Cxquang"
     # 作者主页
@@ -686,16 +686,11 @@ class BotHostingRenew(_PluginBase):
             logger.info("浏览器已提交续期但未确认到账，转 GitHub Actions 复核")
             ok, gh_err = self.__dispatch_github_action()
             if ok:
-                self._notify_message(
-                    "续期已提交，已转 GitHub Actions 复核",
-                    f"{detail}\n"
-                    f"已触发 {self._gh_repo} 的 {self._gh_workflow} 复核续期结果，插件到此结束。\n"
-                    "最终成功/失败由 Action 推送通知。",
-                    failure=False, expiry=expiry)
+                # 插件不推送任何中间态通知，最终成功/失败只由 Action 发一条
                 return {
                     "success": True,
-                    "silent": True,  # 已单独发出提示，避免重复推送
-                    "title": "续期已提交，已转 GitHub Actions 复核",
+                    "silent": True,
+                    "title": "已转 GitHub Actions 复核",
                     "detail": "浏览器已点击续期确认，结果由 Action 推送通知。",
                     "expiry": expiry,
                     "login_method": login_method,
