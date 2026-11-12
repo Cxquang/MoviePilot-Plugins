@@ -16,5 +16,17 @@
       "v0.1.1": "补齐 _PluginBase 必需的 get_command / get_page 抽象方法，get_form 改为返回（页面元素 + 配置默认值）元组，API 无条件注册并在入口检查启用状态",
       "v0.1.0": "初始版本：POST /api/v1/plugin/NcmQr/qr 接收 base64 登录二维码，经企微代理上传临时素材后发送企业微信图片消息（无需公网入站）；监听 UserMessage 事件，企业微信回复「登录」关键词时反向调用 Songloft ncm-daily 免 JWT 端点获取新码"
     }
+  },
+  "MjjTrafficMonitor": {
+    "name": "MJJ主机专用流量监控",
+    "description": "监控 MJJ 主机云评测平台（share.cjy.me）账号的主机专用流量余额，低于阈值时通过 MoviePilot 消息渠道提醒充值，余额恢复后发送恢复通知；支持自定义阈值与检查周期。",
+    "labels": "站点,消息通知",
+    "version": "1.0.0",
+    "icon": "Speedtest.png",
+    "author": "Cxquang",
+    "level": 1,
+    "history": {
+      "v1.0.0": "初始版本：账号密码登录并持久化 Cookie 会话，解析用户信息页的主机专用流量余额；剩余低于阈值（默认 2GB）时每次检查都提醒，余额恢复时发送恢复通知；支持 Cron 检查周期（默认每小时）、代理、检查失败通知与详情页一键检查"
+    }
   }
 }
