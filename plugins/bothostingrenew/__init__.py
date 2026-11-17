@@ -22,6 +22,7 @@ import traceback
 import subprocess
 from datetime import datetime, timezone, timedelta
 from typing import Any, List, Dict, Tuple, Optional
+from urllib.parse import urlparse
 
 import requests
 
@@ -33,7 +34,7 @@ from app.schemas.types import EventType, NotificationType
 
 # 站点常量（来自前端逆向：PUBLIC_API_URL / PUBLIC_DISCORD_CLIENT_ID）
 BASE_URL = "https://bot-hosting.net"
-BILLINGS_URL = f"{BASE_URL}/a/billings"
+BILLINGS_URL = f"{BASE_URL}/dash/billings"
 DISCORD_LOGIN_URL = f"{BASE_URL}/login/discord"
 DISCORD_CLIENT_ID = "884382422530158623"
 DISCORD_AUTHORIZE_API = "https://discord.com/api/v9/oauth2/authorize"
@@ -484,11 +485,15 @@ class BotHostingRenew(_PluginBase):
 
         # 网络/接口异常且未解析到任何页面数据时，直接报错，避免无意义地启动浏览器
         if status.get("error") and not status.get("expiry"):
+            err = str(status.get("error"))
+            if err.startswith("HTTP"):
+                hint = "账单页返回异常状态码（多为站点路由改版或 Cloudflare 拦截），并非网络不通"
+            else:
+                hint = "容器无法访问 bot-hosting.net，请检查容器网络/DNS"
             return {
                 "success": False,
                 "title": "状态查询失败",
-                "detail": f"{status.get('error')}\n"
-                          "容器无法访问 bot-hosting.net，请检查网络连接（浏览器与站点接口为直连，不走代理）。",
+                "detail": f"{err}\n{hint}。\n账单页地址: {BILLINGS_URL}",
                 "time": self.__now_str(),
             }
 
@@ -701,7 +706,7 @@ class BotHostingRenew(_PluginBase):
                 "title": "续期未确认，GitHub Actions 触发失败",
                 "detail": (f"{detail}\n"
                            f"尝试转 GitHub Actions 复核失败：{gh_err}\n"
-                           "请打开账单页手动确认是否到账：https://bot-hosting.net/a/billings"),
+                           f"请打开账单页手动确认是否到账：{BILLINGS_URL}"),
                 "expiry": expiry,
                 "login_method": login_method,
                 "time": self.__now_str(),
@@ -713,7 +718,7 @@ class BotHostingRenew(_PluginBase):
             "detail": (f"续期方式：浏览器模拟点击（{browser_name}，{login_method}）\n"
                        f"{detail}\n"
                        "已点击确认按钮，但账单页未刷新出新的到期时间，无法确认到账。\n"
-                       "请手动核对：https://bot-hosting.net/a/billings\n"
+                       f"请手动核对：{BILLINGS_URL}\n"
                        "提示：把续期方式改为「先插件后续 Action」可由 Action 自动复核并推送最终结果。"),
             "expiry": expiry,
             "login_method": login_method,
@@ -735,19 +740,24 @@ class BotHostingRenew(_PluginBase):
                 BILLINGS_URL,
                 headers={"User-Agent": USER_AGENT, "Accept": "text/html"},
                 cookies={"session_token": session_token, "login": "true", "theme": "system"},
-                timeout=30, allow_redirects=False,
+                timeout=30, allow_redirects=True,
             )
         except Exception as e:
             logger.error(f"Bot-Hosting 账单页访问失败: {e}")
             result["error"] = f"网络异常: {e}"
             return result
 
-        if res.status_code in (301, 302):
-            # 未登录会 302 到 /login
+        final_url = res.url or BILLINGS_URL
+        final_path = urlparse(final_url).path or ""
+        # 站点路由会 308 跳转（/a/billings -> /dash/billings），未登录再 302 到 /login
+        if final_url != BILLINGS_URL:
+            logger.info(f"Bot-Hosting 账单页跳转: {BILLINGS_URL} -> {final_url}")
+        if "/login" in final_path:
+            # 未登录会跳转到 /login
             result["need_relogin"] = True
             return result
         if res.status_code != 200:
-            result["error"] = f"HTTP {res.status_code}"
+            result["error"] = f"HTTP {res.status_code}（最终地址 {final_url}）"
             return result
 
         html = res.text
@@ -1127,7 +1137,7 @@ class BotHostingRenew(_PluginBase):
                 if "/login" in cur_url:
                     return {"ok": False, "error": "SeleniumBase 登录后仍停留在登录页", "logs": logs[-10:]}
 
-                sb.open(f"{BASE_URL}/a/billings")
+                sb.open(BILLINGS_URL)
                 sb.wait_for_ready_state_complete()
                 sb.sleep(3)
 
