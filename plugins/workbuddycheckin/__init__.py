@@ -8,6 +8,7 @@ WorkBuddy + Trae 每日自动签到插件
 import hashlib
 import json
 import platform
+import re
 import secrets
 import threading
 import time
@@ -44,7 +45,7 @@ class WorkBuddyCheckin(_PluginBase):
     # 插件元数据
     plugin_name = "WorkBuddyCheckin"
     plugin_desc = "WorkBuddy 与 Trae 每日自动签到：自动领取积分，支持设置页保存后立即执行一次、定时签到、远程触发、消息通知策略。"
-    plugin_version = "1.7.0"
+    plugin_version = "1.7.1"
     plugin_author = "Cxquang"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/autosignin.png"
     plugin_order = 100
@@ -87,7 +88,13 @@ class WorkBuddyCheckin(_PluginBase):
         self._message_type = message_type if message_type in {t.name for t in NotificationType} else ""
         # Trae 配置
         self._trae_enabled = config.get("trae_enabled", False)
-        self._trae_access_token = (config.get("trae_access_token") or "").strip()
+        self._trae_access_token = self._extract_jwt((config.get("trae_access_token") or "").strip())
+        if self._trae_access_token and len(self._trae_access_token) < 200:
+            logger.warning(
+                "WorkBuddyCheckin: 填入的 Trae Access Token 长度异常（%d 字符），"
+                "请确认完整复制了以 eyJ 开头的三段式 JWT（约 1000 字符）"
+                % len(self._trae_access_token)
+            )
         self._trae_refresh_token = (config.get("trae_refresh_token") or "").strip()
         self._trae_uid = (config.get("trae_uid") or "").strip()
         self._trae_host = (config.get("trae_host") or "https://api.trae.cn").strip().rstrip("/")
@@ -574,6 +581,14 @@ class WorkBuddyCheckin(_PluginBase):
         detail = data.get("Message") or data.get("Error") or data.get("message") or body
         raise TokenInvalidError(f"HTTP {resp.status_code} {detail}".strip())
 
+    @staticmethod
+    def _extract_jwt(text: str) -> str:
+        """从填入内容中提取 JWT，兼容误带标签/换行/空格的粘贴"""
+        if not text:
+            return ""
+        match = re.search(r"eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+", text)
+        return match.group(0) if match else text
+
     def _trae_get_access_token(self) -> str:
         """优先使用用户手动配置的 accessToken，否则用 refreshToken 自动换新"""
         if self._trae_access_token:
@@ -582,7 +597,10 @@ class WorkBuddyCheckin(_PluginBase):
 
     def _trae_get_status(self, access_token: str) -> dict:
         """查询 Trae 今日签到状态"""
-        logger.info("WorkBuddyCheckin: 请求 Trae 状态接口 .../checkin_credits/status")
+        logger.info(
+            "WorkBuddyCheckin: 请求 Trae 状态接口 .../checkin_credits/status"
+            f"（token 长度 {len(access_token)}）"
+        )
         resp = self._session.post(
             f"{self._trae_host}/trae/api/v2/ug/checkin_credits/status",
             headers=self._trae_headers(access_token), json={}, timeout=(5, 20)
@@ -759,6 +777,14 @@ class WorkBuddyCheckin(_PluginBase):
             token = self._trae_get_access_token()
             status = self._trae_get_status(token)
             code = status.get("code", -1)
+            if code == 1001:
+                return self._finish(
+                    "fail", "Trae签到失败：Token 无效",
+                    f"状态接口返回 code=1001（鉴权失败）。\n"
+                    f"当前 AccessToken 长度 {len(self._trae_access_token)} 字符，"
+                    "完整 JWT 约 1000 字符、以 eyJ 开头、三段用英文句点分隔。\n"
+                    "请重新从桌面 trae_token.txt 复制完整 token 粘贴（不要带标签文字、换行或空格），"
+                    "保存后再执行一次", prefix="trae")
             if code != 0:
                 return self._finish(
                     "fail", "Trae签到失败",
