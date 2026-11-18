@@ -21,6 +21,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import requests
 from apscheduler.triggers.cron import CronTrigger
 
+from app.core.config import settings
 from app.log import logger
 from app.plugins import _PluginBase
 
@@ -60,7 +61,7 @@ class MjjTrafficMonitor(_PluginBase):
     # 插件图标
     plugin_icon = "Speedtest.png"
     # 插件版本
-    plugin_version = "1.0.0"
+    plugin_version = "1.0.1"
     # 插件作者
     plugin_author = "Cxquang"
     # 作者主页
@@ -78,6 +79,7 @@ class MjjTrafficMonitor(_PluginBase):
     _threshold_gb: float = 2.0
     _cron: str = "0 * * * *"
     _proxy: str = ""
+    _use_system_proxy: bool = True
     _notify_on_error: bool = True
     _last_result: Dict[str, Any] = {}
 
@@ -98,6 +100,7 @@ class MjjTrafficMonitor(_PluginBase):
             self._threshold_gb = 2.0
         self._cron = (config.get("cron") or "0 * * * *").strip() or "0 * * * *"
         self._proxy = (config.get("proxy") or "").strip()
+        self._use_system_proxy = bool(config.get("use_system_proxy", True))
         self._notify_on_error = bool(config.get("notify_on_error", True))
         self._last_result = self.get_data("last_result") or {}
 
@@ -119,6 +122,7 @@ class MjjTrafficMonitor(_PluginBase):
             "threshold_gb": self._threshold_gb,
             "cron": self._cron,
             "proxy": self._proxy,
+            "use_system_proxy": self._use_system_proxy,
             "notify_on_error": self._notify_on_error,
             "run_once": run_once,
         })
@@ -250,7 +254,12 @@ class MjjTrafficMonitor(_PluginBase):
             "Accept-Language": "zh-CN,zh;q=0.9",
         })
         if self._proxy:
-            session.proxies = {"http": self._proxy, "https": self._proxy}
+            proxy = self._normalize_proxy(self._proxy)
+            session.proxies = {"http": proxy, "https": proxy}
+        else:
+            proxies = self._system_proxies()
+            if proxies:
+                session.proxies = proxies
         # 恢复上次保存的 Cookie（sessionid 等）
         saved = self.get_data("cookies") or {}
         if isinstance(saved, dict):
@@ -290,6 +299,31 @@ class MjjTrafficMonitor(_PluginBase):
         if not self._is_logged_in(html):
             raise RuntimeError("登录失败：请检查账号密码，或站点触发了人机验证")
         return html
+
+    def _system_proxies(self) -> Optional[Dict[str, str]]:
+        """按开关读取 MP 系统代理（设置 → 网络 → 代理 IP:PORT）"""
+        if not self._use_system_proxy:
+            return None
+        proxy = (getattr(settings, "PROXY_HOST", None) or "").strip()
+        if not proxy:
+            logger.info("MjjTrafficMonitor: 已开启使用 MP 系统代理，但 MP 未配置代理，改走直连")
+            return None
+        proxy = self._normalize_proxy(proxy)
+        logger.info(f"MjjTrafficMonitor: 使用 MP 系统代理 {self._mask_proxy(proxy)}")
+        return {"http": proxy, "https": proxy}
+
+    @staticmethod
+    def _normalize_proxy(proxy: str) -> str:
+        """补全代理协议，MP 系统代理常见格式为 IP:PORT"""
+        proxy = (proxy or "").strip()
+        if proxy and not re.match(r"^https?://", proxy, re.I):
+            proxy = "http://" + proxy
+        return proxy
+
+    @staticmethod
+    def _mask_proxy(proxy: str) -> str:
+        """隐藏代理地址中的账号密码"""
+        return re.sub(r"//[^/@]+@", "//***@", proxy)
 
     def _save_cookies(self, session: requests.Session):
         """持久化站点 Cookie，避免每次检查都重新登录"""
@@ -443,8 +477,17 @@ class MjjTrafficMonitor(_PluginBase):
                         ]},
                         {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
                             {"component": "VTextField", "props": {
-                                "model": "proxy", "label": "代理地址（可选）",
+                                "model": "proxy", "label": "代理地址（可选，优先于系统代理）",
                                 "placeholder": "http://127.0.0.1:7890"
+                            }}
+                        ]},
+                    ]},
+                    {"component": "VRow", "content": [
+                        {"component": "VCol", "props": {"cols": 12}, "content": [
+                            {"component": "VSwitch", "props": {
+                                "model": "use_system_proxy",
+                                "label": "使用 MP 系统代理",
+                                "placeholder": "走 MoviePilot 设置 → 网络 → 代理（IP:PORT），上方代理地址留空时生效"
                             }}
                         ]},
                     ]},
@@ -462,6 +505,7 @@ class MjjTrafficMonitor(_PluginBase):
                         "text": "登录 share.cjy.me 后解析账号的「主机专用流量」余额：低于阈值时每次检查都会提醒，"
                                 "余额回到阈值以上时发送一次恢复通知。默认每小时检查一次、剩余低于 2GB 提醒。"
                                 "站点每周一会将专用流量按比例转换为通用流量，周一余额下降属于正常现象。"
+                                "代理优先级：上方代理地址 > MP 系统代理（开关开启时）> 直连。"
                     }},
                 ],
             }
@@ -472,6 +516,7 @@ class MjjTrafficMonitor(_PluginBase):
             "threshold_gb": 2,
             "cron": "0 * * * *",
             "proxy": "",
+            "use_system_proxy": True,
             "notify_on_error": True,
             "run_once": False,
         }
